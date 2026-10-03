@@ -101,3 +101,18 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Every pull request that adds or widens
 ## License
 
 [MIT](./LICENSE)
+
+## Development
+
+Requires Node 22+.
+
+```bash
+npm install
+npm run typecheck   # tsc --noEmit
+npm test            # vitest run
+npm run check       # both
+```
+
+The current code is pure domain logic only (command parser, model profiles, run-state transitions). It performs no I/O, and has no Slack, provider, or network dependencies.
+
+Command grammar: `/codex|/claude|/auto <fast|default|deep> <prompt>`, `/status`, `/cancel`, `/approve run-<id>`. Anything else is rejected.
