@@ -1,0 +1,4 @@
+# Default reviewers for ThreadRunner
+# Only the repo owner should be required for review in the initial stage.
+
+* @dnaielfergy
