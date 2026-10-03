@@ -38,7 +38,7 @@ export type CreateRunResult =
   | { readonly status: "created"; readonly run: Run }
   /** The inbound event or message was already seen. Callers should ignore it quietly. */
   | { readonly status: "duplicate" }
-  /** A different message tried to start a run in a thread that already has one. */
+  /** A different message tried to start a run in a thread that already has one. Recorded, so a retry of the same event is a `duplicate`. */
   | { readonly status: "rejected"; readonly reason: "thread_already_has_run" }
   | { readonly status: "invalid"; readonly field: string };
 
@@ -114,6 +114,10 @@ function insertEvent(store: Store, runId: string, type: RunEvent["type"], from: 
 /**
  * Record an inbound event and create its run in one transaction. A duplicate event ID, or a
  * second event for the same (team, channel, message_ts), yields `duplicate` and writes nothing.
+ *
+ * An event rejected because its thread already has a run is recorded too (with no run), so a Slack
+ * retry of that same event returns `duplicate` and the caller does not repeat the rejection reply.
+ * Malformed input is never recorded.
  */
 export function createRunFromEvent(store: Store, input: NewRunInput): CreateRunResult {
   const invalid = invalidNewRunField(input);
@@ -128,7 +132,15 @@ export function createRunFromEvent(store: Store, input: NewRunInput): CreateRunR
     const threadTaken = store.db
       .prepare("SELECT 1 AS x FROM runs WHERE team_id = ? AND channel_id = ? AND root_thread_ts = ?")
       .get(input.teamId, input.channelId, input.rootThreadTs);
-    if (threadTaken) return { status: "rejected", reason: "thread_already_has_run" };
+    if (threadTaken) {
+      store.db
+        .prepare(
+          `INSERT INTO inbound_events (team_id, event_id, channel_id, message_ts, run_id, outcome, received_at)
+           VALUES (?, ?, ?, ?, NULL, 'rejected_thread_has_run', ?)`,
+        )
+        .run(input.teamId, input.eventId, input.channelId, input.messageTs, timestamp(store));
+      return { status: "rejected", reason: "thread_already_has_run" };
+    }
 
     const id = allocateRunId(store);
     const now = timestamp(store);
@@ -140,7 +152,7 @@ export function createRunFromEvent(store: Store, input: NewRunInput): CreateRunR
       )
       .run(id, input.teamId, input.userId, input.channelId, input.rootThreadTs, input.provider, input.profile, input.prompt, state, now, now);
     store.db
-      .prepare("INSERT INTO inbound_events (team_id, event_id, channel_id, message_ts, run_id, received_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .prepare("INSERT INTO inbound_events (team_id, event_id, channel_id, message_ts, run_id, outcome, received_at) VALUES (?, ?, ?, ?, ?, 'created', ?)")
       .run(input.teamId, input.eventId, input.channelId, input.messageTs, id, now);
     insertEvent(store, id, "created", null, state, now);
 

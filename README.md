@@ -127,6 +127,6 @@ Runs, inbound-event IDs, run events, approvals, and the outbound message queue l
 - **Outbox:** messages are stored, not sent. A sender lists deliverable messages (oldest pending per run), then must call `claimMessage` immediately before posting; it refuses if the run was cancelled in the meantime. Long bodies go through `enqueueMessageParts`. Failures are recorded as fixed reason codes, never free text. Bodies may contain provider output: the sender must escape Slack markup (see the doc comment on `enqueueMessage`).
 - **Journal mode:** WAL, with `foreign_keys = ON`, `busy_timeout = 5000`, and `synchronous = FULL`. Opening fails if WAL cannot be enabled.
 - **Schema versioning:** tracked with `PRAGMA user_version` and forward-only migrations in `src/store/schema.ts`. A database with a newer version than the code supports is refused.
-- **Guarantees enforced in the schema:** unique `(team, event_id)` and `(team, channel, message_ts)`; one run per `(team, channel, root thread)`; immutable binding columns; append-only events, approvals, and inbound events; no outbox destination columns.
+- **Guarantees enforced in the schema:** unique `(team, event_id)` and `(team, channel, message_ts)` (events rejected for an occupied thread are recorded too, so retries are quiet duplicates); one run per `(team, channel, root thread)`; immutable binding columns; append-only events, approvals, and inbound events; no outbox destination columns.
 
 Run the store tests (they use temporary database files) with `npm test`, or `npx vitest run src/store`.

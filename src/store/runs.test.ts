@@ -84,7 +84,53 @@ describe("run creation and idempotency", () => {
     const second = createRunFromEvent(s, newRun({ eventId: "Ev0AAAAAAA2", messageTs: "1700000005.000100" }));
     expect(second).toEqual({ status: "rejected", reason: "thread_already_has_run" });
     expect(count(s, "runs")).toBe(1);
+    // The rejected event is recorded, with no run attached.
+    expect(count(s, "inbound_events")).toBe(2);
+    expect(s.db.prepare("SELECT run_id, outcome FROM inbound_events WHERE event_id = 'Ev0AAAAAAA2'").get()).toEqual({
+      run_id: null,
+      outcome: "rejected_thread_has_run",
+    });
+  });
+
+  it("treats a retried rejected event as a duplicate, and creates no run", () => {
+    const s = store();
+    createRunFromEvent(s, newRun());
+    const rejected = newRun({ eventId: "Ev0AAAAAAA2", messageTs: "1700000005.000100" });
+    expect(createRunFromEvent(s, rejected)).toEqual({ status: "rejected", reason: "thread_already_has_run" });
+    expect(createRunFromEvent(s, rejected)).toEqual({ status: "duplicate" });
+    // The same message arriving under a different event ID (message + app_mention) is a duplicate too.
+    expect(createRunFromEvent(s, { ...rejected, eventId: "Ev0AAAAAAA3" })).toEqual({ status: "duplicate" });
+    expect(count(s, "runs")).toBe(1);
+    expect(count(s, "inbound_events")).toBe(2);
+    expect(count(s, "run_events")).toBe(1);
+  });
+
+  it("does not record malformed input as an event", () => {
+    const s = store();
+    createRunFromEvent(s, newRun());
+    expect(createRunFromEvent(s, newRun({ eventId: "bad", messageTs: "1700000005.000100" })).status).toBe("invalid");
     expect(count(s, "inbound_events")).toBe(1);
+  });
+
+  it("rolls back the rejected-event record if its insert fails mid-transaction", () => {
+    const s = store();
+    createRunFromEvent(s, newRun());
+    s.db.exec("CREATE TRIGGER boom BEFORE INSERT ON inbound_events WHEN NEW.run_id IS NULL BEGIN SELECT RAISE(ABORT, 'boom'); END");
+    expect(() => createRunFromEvent(s, newRun({ eventId: "Ev0AAAAAAA2", messageTs: "1700000005.000100" }))).toThrow(/boom/);
+    expect(count(s, "inbound_events")).toBe(1);
+  });
+
+  it("the database only allows a NULL run_id for a rejected outcome", () => {
+    const s = store();
+    createRunFromEvent(s, newRun());
+    const insert = (runId: string | null, outcome: string) =>
+      s.db
+        .prepare("INSERT INTO inbound_events (team_id, event_id, channel_id, message_ts, run_id, outcome, received_at) VALUES ('T0AAAAAAA', ?, 'C0AAAAAAA', ?, ?, ?, 1)")
+        .run(`Ev${Math.random().toString(36).slice(2, 8)}`, `17000000${Math.floor(Math.random() * 90 + 10)}.000100`, runId, outcome);
+    expect(() => insert(null, "created")).toThrow();
+    expect(() => insert("run-aaa1", "rejected_thread_has_run")).toThrow();
+    expect(() => insert(null, "bogus")).toThrow();
+    expect(() => insert(null, "rejected_thread_has_run")).not.toThrow();
   });
 
   it.each([

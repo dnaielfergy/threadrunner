@@ -36,8 +36,11 @@ export const MIGRATIONS: readonly string[] = [
     event_id    TEXT NOT NULL,
     channel_id  TEXT NOT NULL,
     message_ts  TEXT NOT NULL,
-    run_id      TEXT NOT NULL REFERENCES runs (id),
+    -- NULL only for an event that was rejected and therefore created no run.
+    run_id      TEXT REFERENCES runs (id),
+    outcome     TEXT NOT NULL CHECK (outcome IN ('created', 'rejected_thread_has_run')),
     received_at INTEGER NOT NULL,
+    CHECK ((outcome = 'created') = (run_id IS NOT NULL)),
     UNIQUE (team_id, event_id),
     UNIQUE (team_id, channel_id, message_ts)
   ) STRICT;
