@@ -116,3 +116,16 @@ npm run check       # both
 The current code is pure domain logic only (command parser, model profiles, run-state transitions). It performs no I/O, and has no Slack, provider, or network dependencies.
 
 Command grammar: `/codex|/claude|/auto <fast|default|deep> <prompt>`, `/status`, `/cancel`, `/approve run-<id>`. Anything else is rejected.
+
+## Database
+
+Runs, inbound-event IDs, run events, approvals, and the outbound message queue live in a local SQLite file (`src/store/`). It uses Node's built-in `node:sqlite`, so there is no native build and no new dependency. Node currently prints an `ExperimentalWarning` for it; the warning is not suppressed.
+
+- **Location:** set `DATABASE_PATH` to an absolute path outside any git repository (see `.env.example`).
+- **Permissions:** the directory is created `0700` and the file `0600`. Existing stricter modes are never loosened. The store refuses an existing file that is group/world-accessible, a symlink, or inside a git working tree.
+- **Sensitive data:** each run stores its prompt once, in `runs.prompt`, because the runner needs it. Run events, outbox messages, and errors never copy it. No secrets are written to the database. `*.db`, `*.db-wal`, and `*.db-shm` are git-ignored.
+- **Journal mode:** WAL, with `foreign_keys = ON`, `busy_timeout = 5000`, and `synchronous = FULL`. Opening fails if WAL cannot be enabled.
+- **Schema versioning:** tracked with `PRAGMA user_version` and forward-only migrations in `src/store/schema.ts`. A database with a newer version than the code supports is refused.
+- **Guarantees enforced in the schema:** unique `(team, event_id)` and `(team, channel, message_ts)`; one run per `(team, channel, root thread)`; immutable binding columns; append-only events, approvals, and inbound events; no outbox destination columns.
+
+Run the store tests (they use temporary database files) with `npm test`, or `npx vitest run src/store`.
