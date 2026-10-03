@@ -17,6 +17,7 @@ export type ParseErrorCode =
   | "unknown_profile"
   | "missing_prompt"
   | "unexpected_arguments"
+  | "prompt_too_long"
   | "malformed_approval";
 
 export type ParseResult =
@@ -31,6 +32,12 @@ const TASK_COMMANDS = {
   "/claude": "claude",
   "/auto": "auto",
 } as const satisfies Record<string, Provider>;
+
+/** Upper bound on the prompt, in UTF-16 code units. */
+export const MAX_PROMPT_LENGTH = 4000;
+
+// Bidirectional override/isolate controls can make logs and echoed text misleading.
+const BIDI_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 
 // Anything that is not printable text plus ordinary whitespace (e.g. NUL or other control chars).
 const DISALLOWED_CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/;
@@ -52,11 +59,19 @@ const fail = (error: ParseErrorCode, message: string): ParseResult => ({ ok: fal
  * tokenised, expanded, or interpreted as shell.
  */
 export function parseCommand(input: string): ParseResult {
-  if (DISALLOWED_CONTROL.test(input)) {
-    return fail("not_a_command", "message contains control characters");
+  if (DISALLOWED_CONTROL.test(input) || BIDI_CONTROL.test(input)) {
+    return fail("not_a_command", "message contains disallowed control characters");
   }
 
   const text = input.trim();
+
+  // Approval is a state change: exact single-line `/approve <run-id>` only, no loose whitespace.
+  if (/^\/approve(\s|$)/.test(text)) {
+    const id = /^\/approve (\S+)$/.exec(text)?.[1] ?? "";
+    if (!RUN_ID_PATTERN.test(id)) return fail("malformed_approval", "usage: /approve <run-id>");
+    return { ok: true, command: { kind: "approve", runId: id } };
+  }
+
   if (!text.startsWith("/")) return fail("not_a_command", "message is not a command");
 
   const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(text);
@@ -66,13 +81,6 @@ export function parseCommand(input: string): ParseResult {
   if (name === "/status" || name === "/cancel") {
     if (rest !== "") return fail("unexpected_arguments", `${name} takes no arguments`);
     return { ok: true, command: { kind: name === "/status" ? "status" : "cancel" } };
-  }
-
-  if (name === "/approve") {
-    if (!RUN_ID_PATTERN.test(rest)) {
-      return fail("malformed_approval", "usage: /approve <run-id>");
-    }
-    return { ok: true, command: { kind: "approve", runId: rest } };
   }
 
   if (Object.hasOwn(TASK_COMMANDS, name)) {
@@ -94,5 +102,8 @@ function parseTask(provider: Provider, name: string, rest: string): ParseResult 
 
   const prompt = rest.slice(first.length).trim();
   if (prompt === "") return fail("missing_prompt", usage);
+  if (prompt.length > MAX_PROMPT_LENGTH) {
+    return fail("prompt_too_long", `prompt exceeds ${MAX_PROMPT_LENGTH} characters`);
+  }
   return { ok: true, command: { kind: "task", provider, profile: first, prompt } };
 }
