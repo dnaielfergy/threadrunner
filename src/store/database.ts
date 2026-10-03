@@ -51,16 +51,15 @@ function enclosingGitRoot(path: string): string | null {
 
 /**
  * An existing directory is verified, never modified. If someone else can write to it they can
- * rename the database away and plant their own file, so the 0600 file check alone is not enough.
- * A sticky directory (like /tmp) owned by us is acceptable.
+ * rename the database away or create files the database will use (`-wal`, `-shm`, `-journal`),
+ * so the 0600 file check alone is not enough. A sticky bit does not help: it stops deletion, not creation.
  */
 function checkDirectory(dir: string): void {
   const stat = statSync(dir);
   if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
     throw new StoreError("insecure_location", `database directory ${dir} is not owned by the current user; use a directory you own`);
   }
-  const sticky = (stat.mode & 0o1000) !== 0;
-  if ((stat.mode & 0o022) !== 0 && !sticky) {
+  if ((stat.mode & 0o022) !== 0) {
     throw new StoreError("insecure_location", `database directory ${dir} is writable by other users; run chmod go-w on it or use a private directory`);
   }
 }
