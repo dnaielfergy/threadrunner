@@ -3,6 +3,8 @@ import { RUN_STATES, TERMINAL_STATES } from "../domain/run-state.js";
 import { MAX_OUTBOX_BODY_LENGTH } from "./validate.js";
 
 export const MAX_OUTBOX_ATTEMPTS = 5;
+/** A cancellation acknowledgement is the user's only signal that /cancel worked, so it gets more tries. */
+export const MAX_CANCEL_ACK_ATTEMPTS = 20;
 
 const list = (values: readonly string[]): string => values.map((v) => `'${v}'`).join(", ");
 
@@ -63,7 +65,7 @@ export const MIGRATIONS: readonly string[] = [
     kind       TEXT NOT NULL CHECK (kind IN ('message', 'cancel_ack')),
     body       TEXT NOT NULL CHECK (length(body) BETWEEN 1 AND ${MAX_OUTBOX_BODY_LENGTH}),
     status     TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
-    attempts   INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND ${MAX_OUTBOX_ATTEMPTS}),
+    attempts   INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND ${MAX_CANCEL_ACK_ATTEMPTS}),
     last_error TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,

@@ -1,6 +1,7 @@
-import { chmodSync, existsSync, mkdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { migrate } from "./database.js";
 import { describe, expect, it } from "vitest";
 import { createRunFromEvent, getRun, openStore, SCHEMA_VERSION, StoreError } from "./index.js";
 import { BINDING, newRun, open, tempDbPath, tempDir } from "./test-utils.js";
@@ -109,6 +110,47 @@ describe("file and directory permissions", () => {
     expect(() => open(path, { allowInRepo: true })).not.toThrow();
   });
 
+  it.each([0o777, 0o770, 0o722, 0o702])("refuses an existing directory with mode %o (writable by others) and does not modify it", (dirMode) => {
+    const dir = tempDir();
+    const shared = join(dir, "shared");
+    mkdirSync(shared);
+    chmodSync(shared, dirMode);
+    expect(() => openStore({ path: join(shared, "threadrunner.db") })).toThrowError(expect.objectContaining({ code: "insecure_location" }));
+    expect(mode(shared)).toBe(dirMode);
+    expect(existsSync(join(shared, "threadrunner.db"))).toBe(false);
+  });
+
+  it("accepts an existing directory that others can read but not write (0755) and leaves it alone", () => {
+    const dir = tempDir();
+    const readable = join(dir, "readable");
+    mkdirSync(readable);
+    chmodSync(readable, 0o755);
+    expect(() => open(join(readable, "threadrunner.db"))).not.toThrow();
+    expect(mode(readable)).toBe(0o755);
+  });
+
+  it("accepts a sticky directory owned by the current user (like /tmp)", () => {
+    const dir = tempDir();
+    const sticky = join(dir, "sticky");
+    mkdirSync(sticky);
+    chmodSync(sticky, 0o1777);
+    expect(() => open(join(sticky, "threadrunner.db"))).not.toThrow();
+  });
+
+  it.skipIf(typeof process.getuid !== "function" || process.getuid() !== 0)("refuses an existing directory owned by another user", () => {
+    const dir = tempDir();
+    const foreign = join(dir, "foreign");
+    mkdirSync(foreign, { mode: 0o700 });
+    chownSync(foreign, 12345, 12345);
+    expect(() => openStore({ path: join(foreign, "threadrunner.db") })).toThrowError(expect.objectContaining({ code: "insecure_location" }));
+  });
+
+  it("the in-repo error names the repository and what to change", () => {
+    const repo = tempDir();
+    mkdirSync(join(repo, ".git"));
+    expect(() => openStore({ path: join(repo, "threadrunner.db") })).toThrowError(/git working tree at .*outside it/);
+  });
+
   it("is a StoreError so callers can distinguish it", () => {
     expect(() => openStore({ path: "relative.db" })).toThrow(StoreError);
   });
@@ -129,5 +171,43 @@ describe("persistence after reopen", () => {
     // The same event after a restart is still a duplicate.
     expect(createRunFromEvent(second, newRun()).status).toBe("duplicate");
     expect(second.db.prepare("SELECT count(*) AS n FROM runs").get()).toEqual({ n: 1 });
+  });
+});
+
+describe("migrations", () => {
+  it("is idempotent: migrating an up-to-date database changes nothing", () => {
+    const path = tempDbPath();
+    const store = open(path);
+    expect(() => migrate(store.db)).not.toThrow();
+    expect(store.db.prepare("PRAGMA user_version").get()).toEqual({ user_version: SCHEMA_VERSION });
+  });
+
+  it("takes the write lock before reading the version, so two starters cannot both apply a migration", () => {
+    const path = tempDbPath();
+    mkdirSync(join(path, ".."), { recursive: true });
+    // A first starter holds the write lock mid-migration.
+    const first = new DatabaseSync(path);
+    first.exec("BEGIN IMMEDIATE");
+    // A second starter must block on the lock before it can even read user_version.
+    const second = new DatabaseSync(path);
+    second.exec("PRAGMA busy_timeout = 0");
+    expect(() => migrate(second)).toThrow(/locked|busy/i);
+    first.exec("ROLLBACK");
+    first.close();
+    // Once the lock is free it migrates normally, and a late second migrate is a no-op.
+    expect(() => migrate(second)).not.toThrow();
+    expect(() => migrate(second)).not.toThrow();
+    expect(second.prepare("PRAGMA user_version").get()).toEqual({ user_version: SCHEMA_VERSION });
+    second.close();
+  });
+
+  it("a failed migration rolls back completely and leaves version 0", () => {
+    const path = tempDbPath();
+    mkdirSync(join(path, ".."), { recursive: true });
+    const raw = new DatabaseSync(path);
+    raw.exec("CREATE TABLE something_else (x)");
+    expect(() => migrate(raw)).toThrowError(expect.objectContaining({ code: "foreign_database" }));
+    expect(raw.prepare("PRAGMA user_version").get()).toEqual({ user_version: 0 });
+    raw.close();
   });
 });

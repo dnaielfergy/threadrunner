@@ -51,7 +51,7 @@ export type TransitionError = RunError | "stale_state" | "illegal_transition";
 export type TransitionOutcome = { readonly ok: true; readonly run: Run } | { readonly ok: false; readonly error: TransitionError };
 export type ApprovalOutcome =
   | { readonly ok: true; readonly approval: Approval }
-  | { readonly ok: false; readonly error: RunError | "already_approved" };
+  | { readonly ok: false; readonly error: RunError | "not_awaiting_approval" | "already_approved" };
 
 const MAX_RUN_ID_ATTEMPTS = 5;
 
@@ -191,8 +191,9 @@ export function transitionRun(store: Store, binding: Binding, expected: RunState
 }
 
 /**
- * Record that the bound user approved this run, once. This only stores the fact; it enforces
- * nothing and unlocks nothing (approval logic belongs to a later issue).
+ * Record that the bound user approved this run, once, and only while it is `awaiting_approval`.
+ * A premature approval would otherwise be stored and then block the real one. This only stores
+ * the fact: it does not move the run to `queued_write` or unlock anything (that is a later issue).
  */
 export function recordApproval(store: Store, binding: Binding, runId: string): ApprovalOutcome {
   if (invalidBindingField(binding) || !isRunId(runId)) return { ok: false, error: "invalid_input" };
@@ -200,6 +201,7 @@ export function recordApproval(store: Store, binding: Binding, runId: string): A
   return inTransaction(store, (): ApprovalOutcome => {
     const run = findByBinding(store, binding);
     if (!run || run.id !== runId) return { ok: false, error: "not_found" };
+    if (run.state !== "awaiting_approval") return { ok: false, error: "not_awaiting_approval" };
     if (store.db.prepare("SELECT 1 AS x FROM approvals WHERE run_id = ?").get(run.id)) return { ok: false, error: "already_approved" };
 
     const now = timestamp(store);

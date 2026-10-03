@@ -1,14 +1,19 @@
 import { describe, expect, it } from "vitest";
 import {
   CANCEL_ACK_BODY,
+  MAX_CANCEL_ACK_ATTEMPTS,
   MAX_OUTBOX_ATTEMPTS,
+  MAX_OUTBOX_PARTS,
   MAX_OUTBOX_BODY_LENGTH,
+  claimMessage,
   createRunFromEvent,
   enqueueMessage,
+  enqueueMessageParts,
   getMessageStatus,
   listPendingMessages,
   markSent,
   recordFailedAttempt,
+  splitMessage,
   transitionRun,
 } from "./index.js";
 import { BINDING, fakeClock, fakeIds, newRun, open, tempDbPath } from "./test-utils.js";
@@ -115,20 +120,24 @@ describe("status, attempts and idempotent send", () => {
     const { s, runId } = setup();
     enqueueMessage(s, runId, "hi");
     for (let i = 1; i < MAX_OUTBOX_ATTEMPTS; i++) {
-      expect(recordFailedAttempt(s, 1, "timeout")).toEqual({ ok: true, status: "pending" });
+      expect(recordFailedAttempt(s, 1, "network")).toEqual({ ok: true, status: "pending" });
       expect(getMessageStatus(s, 1)?.attempts).toBe(i);
     }
-    expect(recordFailedAttempt(s, 1, "timeout")).toEqual({ ok: true, status: "failed" });
+    expect(recordFailedAttempt(s, 1, "network")).toEqual({ ok: true, status: "failed" });
     expect(listPendingMessages(s)).toEqual([]);
-    expect(recordFailedAttempt(s, 1, "again")).toEqual({ ok: false, error: "not_pending" });
+    expect(recordFailedAttempt(s, 1, "unknown")).toEqual({ ok: false, error: "not_pending" });
     expect(markSent(s, 1)).toEqual({ ok: false, error: "not_pending" });
   });
 
-  it("bounds stored error text", () => {
+  it("stores only a fixed reason code, never caller-supplied text", () => {
     const { s, runId } = setup();
     enqueueMessage(s, runId, "hi");
-    recordFailedAttempt(s, 1, "e".repeat(5000));
-    expect(String(s.db.prepare("SELECT last_error FROM outbox_messages").get()?.["last_error"]).length).toBe(200);
+    const token = "xoxb-123456789012-secret-token";
+    expect(recordFailedAttempt(s, 1, token as never)).toEqual({ ok: false, error: "invalid_input" });
+    expect(getMessageStatus(s, 1)?.attempts).toBe(0);
+    recordFailedAttempt(s, 1, "rate_limited");
+    expect(s.db.prepare("SELECT last_error FROM outbox_messages").get()).toEqual({ last_error: "rate_limited" });
+    expect(JSON.stringify(s.db.prepare("SELECT * FROM outbox_messages").all())).not.toContain("xoxb");
   });
 
   it("reports unknown ids", () => {
@@ -211,5 +220,141 @@ describe("cancellation (invariant 8)", () => {
     const { s, runId } = setup();
     transitionRun(s, BINDING, "received", "failed");
     expect(enqueueMessage(s, runId, "it failed").ok).toBe(true);
+  });
+});
+
+describe("claiming before send (cancel races)", () => {
+  it("refuses a claim when the run is cancelled after the message was listed", () => {
+    const { s, runId } = setup();
+    enqueueMessage(s, runId, "about to go out");
+    const listed = listPendingMessages(s);
+    expect(listed).toHaveLength(1);
+    transitionRun(s, BINDING, "received", "cancelled");
+    expect(claimMessage(s, listed[0]?.id ?? 0)).toMatchObject({ ok: false });
+    expect(markSent(s, listed[0]?.id ?? 0)).toEqual({ ok: false, error: "not_pending" });
+  });
+
+  it("a claim on a live run returns the message with its destination re-read from the binding", () => {
+    const { s, runId } = setup();
+    enqueueMessage(s, runId, "hello");
+    expect(claimMessage(s, 1)).toEqual({
+      ok: true,
+      message: {
+        id: 1,
+        runId,
+        kind: "message",
+        body: "hello",
+        attempts: 0,
+        destination: { teamId: BINDING.teamId, channelId: BINDING.channelId, threadTs: BINDING.rootThreadTs },
+      },
+    });
+  });
+
+  it("still lets the cancellation acknowledgement through after cancel", () => {
+    const { s } = setup();
+    transitionRun(s, BINDING, "received", "cancelled");
+    expect(claimMessage(s, 1)).toMatchObject({ ok: true, message: { kind: "cancel_ack", body: CANCEL_ACK_BODY } });
+  });
+
+  it("refuses a claim on a cancelled run's non-ack message even if its status were pending", () => {
+    const { s, runId } = setup();
+    enqueueMessage(s, runId, "x");
+    transitionRun(s, BINDING, "received", "cancelled");
+    // Force the row back to pending, bypassing the code path, to prove the claim re-checks the run itself.
+    s.db.exec("UPDATE outbox_messages SET status = 'pending' WHERE id = 1");
+    expect(claimMessage(s, 1)).toEqual({ ok: false, error: "run_cancelled" });
+  });
+
+  it("refuses unknown, malformed, already-sent and exhausted messages", () => {
+    const { s, runId } = setup();
+    enqueueMessage(s, runId, "x");
+    expect(claimMessage(s, 99)).toEqual({ ok: false, error: "not_found" });
+    expect(claimMessage(s, -1)).toEqual({ ok: false, error: "invalid_input" });
+    markSent(s, 1);
+    expect(claimMessage(s, 1)).toEqual({ ok: false, error: "not_pending" });
+  });
+});
+
+describe("ordering and delivery caps", () => {
+  it("hands out only the oldest pending message per run, in order", () => {
+    const { s, runId } = setup();
+    enqueueMessage(s, runId, "first");
+    enqueueMessage(s, runId, "second");
+    expect(listPendingMessages(s).map((m) => m.body)).toEqual(["first"]);
+    expect(claimMessage(s, 2)).toEqual({ ok: false, error: "out_of_order" });
+    markSent(s, 1);
+    expect(listPendingMessages(s).map((m) => m.body)).toEqual(["second"]);
+    expect(claimMessage(s, 2).ok).toBe(true);
+  });
+
+  it("different runs do not block each other", () => {
+    const { s, runId } = setup();
+    const other = createRunFromEvent(s, newRun({ eventId: "Ev0AAAAAAA2", messageTs: "1700000002.000100", rootThreadTs: "1700000002.000100" }));
+    if (other.status !== "created") throw new Error("setup");
+    enqueueMessage(s, runId, "a");
+    enqueueMessage(s, other.run.id, "b");
+    expect(listPendingMessages(s).map((m) => m.body)).toEqual(["a", "b"]);
+  });
+
+  it("gives the cancellation acknowledgement a higher attempt cap than ordinary messages", () => {
+    expect(MAX_CANCEL_ACK_ATTEMPTS).toBeGreaterThan(MAX_OUTBOX_ATTEMPTS);
+    const { s } = setup();
+    transitionRun(s, BINDING, "received", "cancelled");
+    for (let i = 0; i < MAX_OUTBOX_ATTEMPTS + 3; i++) expect(recordFailedAttempt(s, 1, "network")).toEqual({ ok: true, status: "pending" });
+    expect(listPendingMessages(s)).toHaveLength(1);
+    for (let i = MAX_OUTBOX_ATTEMPTS + 3; i < MAX_CANCEL_ACK_ATTEMPTS - 1; i++) recordFailedAttempt(s, 1, "network");
+    expect(recordFailedAttempt(s, 1, "network")).toEqual({ ok: true, status: "failed" });
+  });
+});
+
+describe("splitting long messages", () => {
+  it("returns short bodies unchanged", () => {
+    expect(splitMessage("hello\nworld")).toEqual(["hello\nworld"]);
+  });
+
+  it("splits on line boundaries, each part within the limit, preserving all content in order", () => {
+    const body = Array.from({ length: 200 }, (_, i) => `line ${i} ${"x".repeat(40)}`).join("\n");
+    const parts = splitMessage(body, 500);
+    expect(parts.length).toBeGreaterThan(1);
+    for (const part of parts) expect(part.length).toBeLessThanOrEqual(500);
+    expect(parts.join("")).toBe(body);
+    for (const part of parts.slice(0, -1)) expect(part.endsWith("\n")).toBe(true);
+  });
+
+  it("hard-splits a single over-long line without cutting a surrogate pair", () => {
+    const body = "😀".repeat(20); // 40 UTF-16 units
+    const parts = splitMessage(body, 7);
+    for (const part of parts) {
+      expect(part.length).toBeLessThanOrEqual(7);
+      expect([...part].every((c) => c === "😀")).toBe(true);
+    }
+    expect(parts.join("")).toBe(body);
+  });
+
+  it("enqueues all parts in one transaction, in order, to the bound destination", () => {
+    const { s, runId } = setup();
+    const body = Array.from({ length: 150 }, (_, i) => `row ${i} ${"y".repeat(60)}`).join("\n");
+    const result = enqueueMessageParts(s, runId, body);
+    expect(result.ok).toBe(true);
+    const rows = s.db.prepare("SELECT body FROM outbox_messages ORDER BY id").all().map((r) => String(r["body"]));
+    expect(rows.length).toBeGreaterThan(1);
+    expect(rows.join("")).toBe(body);
+    expect(listPendingMessages(s)).toHaveLength(1);
+  });
+
+  it("queues nothing when the body needs too many parts or the run is cancelled", () => {
+    const { s, runId } = setup();
+    expect(enqueueMessageParts(s, runId, "z".repeat(MAX_OUTBOX_BODY_LENGTH * MAX_OUTBOX_PARTS + 1))).toEqual({ ok: false, error: "body_too_large" });
+    expect(s.db.prepare("SELECT count(*) AS n FROM outbox_messages").get()).toEqual({ n: 0 });
+    transitionRun(s, BINDING, "received", "cancelled");
+    expect(enqueueMessageParts(s, runId, "late")).toEqual({ ok: false, error: "run_cancelled" });
+  });
+
+  it("rolls back every part if one insert fails", () => {
+    const { s, runId } = setup();
+    s.db.exec("CREATE TRIGGER boom BEFORE INSERT ON outbox_messages WHEN NEW.body LIKE '%stop%' BEGIN SELECT RAISE(ABORT, 'boom'); END");
+    const body = `${"a".repeat(2999)}\n${"b".repeat(2999)}\nstop`;
+    expect(() => enqueueMessageParts(s, runId, body)).toThrow(/boom/);
+    expect(s.db.prepare("SELECT count(*) AS n FROM outbox_messages").get()).toEqual({ n: 0 });
   });
 });

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { StoreError } from "./errors.js";
@@ -32,7 +32,8 @@ const BUSY_TIMEOUT_MS = 5000;
 
 const defaultRandomId = (): string => randomBytes(10).toString("hex");
 
-function isInsideGitRepo(path: string): boolean {
+/** Returns the directory containing `.git` that encloses `path`, or null. */
+function enclosingGitRoot(path: string): string | null {
   let probe = dirname(path);
   while (!existsSync(probe)) {
     const parent = dirname(probe);
@@ -41,10 +42,26 @@ function isInsideGitRepo(path: string): boolean {
   }
   let dir = realpathSync(probe);
   for (;;) {
-    if (existsSync(join(dir, ".git"))) return true;
+    if (existsSync(join(dir, ".git"))) return dir;
     const parent = dirname(dir);
-    if (parent === dir) return false;
+    if (parent === dir) return null;
     dir = parent;
+  }
+}
+
+/**
+ * An existing directory is verified, never modified. If someone else can write to it they can
+ * rename the database away and plant their own file, so the 0600 file check alone is not enough.
+ * A sticky directory (like /tmp) owned by us is acceptable.
+ */
+function checkDirectory(dir: string): void {
+  const stat = statSync(dir);
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
+    throw new StoreError("insecure_location", `database directory ${dir} is not owned by the current user; use a directory you own`);
+  }
+  const sticky = (stat.mode & 0o1000) !== 0;
+  if ((stat.mode & 0o022) !== 0 && !sticky) {
+    throw new StoreError("insecure_location", `database directory ${dir} is writable by other users; run chmod go-w on it or use a private directory`);
   }
 }
 
@@ -53,10 +70,17 @@ function prepareLocation(path: string, allowInRepo: boolean): void {
   if (typeof path !== "string" || path.length === 0 || path.includes("\u0000") || !isAbsolute(path)) {
     throw new StoreError("invalid_path", "database path must be an absolute file path");
   }
-  if (!allowInRepo && isInsideGitRepo(path)) {
-    throw new StoreError("insecure_location", "database path is inside a git working tree; use a directory outside any repository");
+  const gitRoot = allowInRepo ? null : enclosingGitRoot(path);
+  if (gitRoot) {
+    throw new StoreError(
+      "insecure_location",
+      `database path is inside the git working tree at ${gitRoot} (run data could be committed); choose a directory outside it. ` +
+        "A dotfiles repository at your home directory also triggers this: use a location outside that repository.",
+    );
   }
-  mkdirSync(dirname(path), { recursive: true, mode: DIR_MODE });
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: DIR_MODE });
+  checkDirectory(dir);
 
   let stat;
   try {
@@ -75,28 +99,36 @@ function prepareLocation(path: string, allowInRepo: boolean): void {
   }
 }
 
-function migrate(db: DatabaseSync): void {
-  const row = db.prepare("PRAGMA user_version").get();
-  const version = Number(row?.["user_version"] ?? 0);
-  if (version > SCHEMA_VERSION) {
-    throw new StoreError("schema_too_new", `database schema version ${version} is newer than supported version ${SCHEMA_VERSION}`);
-  }
-  if (version === 0) {
-    const tables = db.prepare("SELECT count(*) AS n FROM sqlite_master").get();
-    if (Number(tables?.["n"] ?? 0) !== 0) {
-      throw new StoreError("foreign_database", "database has tables but no ThreadRunner schema version; refusing to use it");
+/**
+ * Bring the schema up to date. The version is read after taking the write lock, so two processes
+ * starting together cannot both decide to apply the same migration.
+ */
+export function migrate(db: DatabaseSync): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const row = db.prepare("PRAGMA user_version").get();
+    const version = Number(row?.["user_version"] ?? 0);
+    if (version > SCHEMA_VERSION) {
+      throw new StoreError("schema_too_new", `database schema version ${version} is newer than supported version ${SCHEMA_VERSION}`);
     }
-  }
-  for (let next = version + 1; next <= SCHEMA_VERSION; next++) {
-    db.exec("BEGIN IMMEDIATE");
-    try {
+    if (version === 0) {
+      const tables = db.prepare("SELECT count(*) AS n FROM sqlite_master").get();
+      if (Number(tables?.["n"] ?? 0) !== 0) {
+        throw new StoreError("foreign_database", "database has tables but no ThreadRunner schema version; refusing to use it");
+      }
+    }
+    for (let next = version + 1; next <= SCHEMA_VERSION; next++) {
       db.exec(MIGRATIONS[next - 1] as string);
       db.exec(`PRAGMA user_version = ${next}`);
-      db.exec("COMMIT");
-    } catch (error) {
-      db.exec("ROLLBACK");
-      throw error;
     }
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // The original error is the one worth reporting.
+    }
+    throw error;
   }
 }
 
