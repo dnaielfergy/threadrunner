@@ -13,3 +13,17 @@ updates:
       prefix: "deps"
     reviewers:
       - "dnaielfergy"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "dependabot"
+    commit-message:
+      prefix: "deps"
+    reviewers:
+      - "dnaielfergy"

@@ -321,6 +321,12 @@ describe("splitting long messages", () => {
     for (const part of parts.slice(0, -1)) expect(part.endsWith("\n")).toBe(true);
   });
 
+  it("rejects a limit that could never make progress", () => {
+    expect(() => splitMessage("😀", 1)).toThrow(RangeError);
+    expect(() => splitMessage("x", 0)).toThrow(RangeError);
+    expect(splitMessage("😀", 2)).toEqual(["😀"]);
+  });
+
   it("hard-splits a single over-long line without cutting a surrogate pair", () => {
     const body = "😀".repeat(20); // 40 UTF-16 units
     const parts = splitMessage(body, 7);

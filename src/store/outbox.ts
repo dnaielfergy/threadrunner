@@ -49,6 +49,8 @@ const validBody = (body: unknown): body is string => typeof body === "string" &&
  * A single line longer than the limit is cut at the limit (never inside a surrogate pair). Pure.
  */
 export function splitMessage(body: string, max = MAX_OUTBOX_BODY_LENGTH): string[] {
+  // A limit below 2 cannot hold a surrogate pair, so the hard-split below could never advance.
+  if (!Number.isInteger(max) || max < 2) throw new RangeError("max must be an integer of at least 2");
   const parts: string[] = [];
   let current = "";
   const flush = (): void => {
@@ -87,7 +89,9 @@ function insertMessage(store: Store, runId: string, body: string, now: number): 
  * SECURITY (for the sender in #4): `body` may contain provider output influenced by prompt injection.
  * It is stored verbatim and is NOT safe to post as-is. At send time the sender must escape `&`, `<`
  * and `>`, and disable `parse`, `link_names`, and link/media unfurling, or `<!channel>` pings and
- * `<https://evil|Click here>` links will go through.
+ * `<https://evil|Click here>` links will go through. Escaping inflates text (`&` becomes `&amp;`, `<`
+ * becomes `&lt;`), so split on the raw text first, then check the escaped length against Slack's
+ * limits (3000 per section block, 40000 for plain `text`).
  */
 export function enqueueMessage(store: Store, runId: string, body: string): EnqueueOutcome {
   if (!isRunId(runId) || !validBody(body)) return { ok: false, error: "invalid_input" };
@@ -176,6 +180,10 @@ export function listPendingMessages(store: Store, limit = 10): OutboxMessage[] {
  * transaction it re-checks that the message is still pending, is the oldest pending message of its
  * run, and that its run has not been cancelled (the cancellation acknowledgement is exempt), then
  * returns the message with its destination re-read from the run binding.
+ *
+ * This is a re-check, not an exclusive lock: it writes nothing. Delivery is at-least-once, and one
+ * sender process is assumed. Two senders, or a sender that crashes between posting and `markSent`,
+ * can post the same message twice. A leased `sending` state belongs with the retry work in #8.
  *
  * Residual window: a cancel recorded after this call returns but before the network request
  * completes cannot recall that one message. See SECURITY.md.

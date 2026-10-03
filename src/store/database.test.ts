@@ -129,12 +129,12 @@ describe("file and directory permissions", () => {
     expect(mode(readable)).toBe(0o755);
   });
 
-  it("accepts a sticky directory owned by the current user (like /tmp)", () => {
+  it("refuses a sticky world-writable directory even when owned by the current user (like /tmp)", () => {
     const dir = tempDir();
     const sticky = join(dir, "sticky");
     mkdirSync(sticky);
     chmodSync(sticky, 0o1777);
-    expect(() => open(join(sticky, "threadrunner.db"))).not.toThrow();
+    expect(() => openStore({ path: join(sticky, "threadrunner.db") })).toThrowError(expect.objectContaining({ code: "insecure_location" }));
   });
 
   it.skipIf(typeof process.getuid !== "function" || process.getuid() !== 0)("refuses an existing directory owned by another user", () => {
