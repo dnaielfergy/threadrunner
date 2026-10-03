@@ -12,7 +12,12 @@ export const EVENT_ID_PATTERN = /^Ev[A-Za-z0-9]{2,62}$/;
 export const SLACK_TS_PATTERN = /^[0-9]{10}\.[0-9]{6}$/;
 
 export const MAX_OUTBOX_BODY_LENGTH = 3000;
-export const MAX_ERROR_LENGTH = 200;
+/** Cap on parts when a long body is split across several messages. */
+export const MAX_OUTBOX_PARTS = 20;
+
+/** Delivery failures are recorded as codes, never as free text, so provider or HTTP error strings cannot reach the database. */
+export const OUTBOX_FAILURE_REASONS = ["rate_limited", "network", "slack_error", "unknown"] as const;
+export type OutboxFailureReason = (typeof OUTBOX_FAILURE_REASONS)[number];
 
 /** The four fields that permanently identify who and where a run belongs to. */
 export interface Binding {

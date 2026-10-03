@@ -7,6 +7,13 @@ import { BINDING, SECRET_PROMPT, fakeClock, fakeIds, newRun, open, tempDbPath } 
 const count = (store: ReturnType<typeof open>, table: string): number =>
   Number(store.db.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.["n"]);
 
+/** Drive a freshly created run to `awaiting_approval` through legal transitions. */
+function toAwaitingApproval(s: ReturnType<typeof open>): void {
+  for (const [from, to] of [["received", "validated"], ["validated", "queued"], ["queued", "running"], ["running", "awaiting_approval"]] as const) {
+    expect(transitionRun(s, BINDING, from, to).ok).toBe(true);
+  }
+}
+
 function store() {
   return open(tempDbPath(), { now: fakeClock(), randomId: fakeIds() });
 }
@@ -354,27 +361,63 @@ describe("approvals table", () => {
     const s = store();
     const created = createRunFromEvent(s, newRun());
     if (created.status !== "created") throw new Error("setup");
+    toAwaitingApproval(s);
     const result = recordApproval(s, BINDING, created.run.id);
-    expect(result).toMatchObject({ ok: true, approval: { runId: created.run.id, approvedByUserId: BINDING.userId, runState: "received" } });
-    expect(getApproval(s, BINDING)).toMatchObject({ runId: created.run.id, runState: "received" });
+    expect(result).toMatchObject({ ok: true, approval: { runId: created.run.id, approvedByUserId: BINDING.userId, runState: "awaiting_approval" } });
+    expect(getApproval(s, BINDING)).toMatchObject({ runId: created.run.id, runState: "awaiting_approval" });
   });
 
   it("allows at most one approval per run", () => {
     const s = store();
     const created = createRunFromEvent(s, newRun());
     if (created.status !== "created") throw new Error("setup");
+    toAwaitingApproval(s);
     expect(recordApproval(s, BINDING, created.run.id).ok).toBe(true);
     expect(recordApproval(s, BINDING, created.run.id)).toEqual({ ok: false, error: "already_approved" });
     expect(count(s, "approvals")).toBe(1);
     expect(() => s.db.exec("DELETE FROM approvals")).toThrow(/append-only/);
   });
 
+  it.each([
+    ["received", []],
+    ["validated", ["validated"]],
+    ["queued", ["validated", "queued"]],
+    ["running", ["validated", "queued", "running"]],
+    ["completed", ["validated", "queued", "running", "completed"]],
+    ["cancelled", ["cancelled"]],
+    ["failed", ["failed"]],
+  ] as [RunState, RunState[]][])("refuses an approval while the run is %s, leaving no row and no event", (state, route) => {
+    const s = store();
+    const created = createRunFromEvent(s, newRun());
+    if (created.status !== "created") throw new Error("setup");
+    let cur: RunState = "received";
+    for (const step of route) {
+      expect(transitionRun(s, BINDING, cur, step).ok).toBe(true);
+      cur = step;
+    }
+    const events = count(s, "run_events");
+    expect(recordApproval(s, BINDING, created.run.id)).toEqual({ ok: false, error: "not_awaiting_approval" });
+    expect(count(s, "approvals")).toBe(0);
+    expect(count(s, "run_events")).toBe(events);
+    expect(getRun(s, BINDING)?.state).toBe(state);
+  });
+
+  it("a premature approval attempt does not block the real one", () => {
+    const s = store();
+    const created = createRunFromEvent(s, newRun());
+    if (created.status !== "created") throw new Error("setup");
+    expect(recordApproval(s, BINDING, created.run.id).ok).toBe(false);
+    toAwaitingApproval(s);
+    expect(recordApproval(s, BINDING, created.run.id).ok).toBe(true);
+  });
+
   it("recording an approval does not change the run state (no approval logic here)", () => {
     const s = store();
     const created = createRunFromEvent(s, newRun());
     if (created.status !== "created") throw new Error("setup");
+    toAwaitingApproval(s);
     recordApproval(s, BINDING, created.run.id);
-    expect(getRun(s, BINDING)?.state).toBe("received");
+    expect(getRun(s, BINDING)?.state).toBe("awaiting_approval");
   });
 
   it("rejects a malformed run ID", () => {
@@ -389,9 +432,9 @@ describe("prompt handling", () => {
     const s = store();
     const created = createRunFromEvent(s, newRun());
     if (created.status !== "created") throw new Error("setup");
-    transitionRun(s, BINDING, "received", "validated");
+    toAwaitingApproval(s);
     recordApproval(s, BINDING, created.run.id);
-    transitionRun(s, BINDING, "validated", "cancelled");
+    transitionRun(s, BINDING, "awaiting_approval", "cancelled");
 
     const tables = s.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all();
     for (const { name } of tables) {

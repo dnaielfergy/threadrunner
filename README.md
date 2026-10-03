@@ -104,7 +104,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Every pull request that adds or widens
 
 ## Development
 
-Requires Node 22+.
+Requires Node 22.13+ (the first 22.x where `node:sqlite` works without a flag).
 
 ```bash
 npm install
@@ -122,8 +122,9 @@ Command grammar: `/codex|/claude|/auto <fast|default|deep> <prompt>`, `/status`,
 Runs, inbound-event IDs, run events, approvals, and the outbound message queue live in a local SQLite file (`src/store/`). It uses Node's built-in `node:sqlite`, so there is no native build and no new dependency. Node currently prints an `ExperimentalWarning` for it; the warning is not suppressed.
 
 - **Location:** set `DATABASE_PATH` to an absolute path outside any git repository (see `.env.example`).
-- **Permissions:** the directory is created `0700` and the file `0600`. Existing stricter modes are never loosened. The store refuses an existing file that is group/world-accessible, a symlink, or inside a git working tree.
+- **Permissions:** the directory is created `0700` and the file `0600`. Existing modes are verified, never changed: the store refuses an existing file that is group/world-accessible, a symlink, or not yours; an existing directory that is not yours or is writable by others (a sticky directory you own is fine); and any location inside a git working tree (this includes `~/.threadrunner` if your home directory is a dotfiles repo). POSIX only (macOS/Linux); Windows mode bits are not supported.
 - **Sensitive data:** each run stores its prompt once, in `runs.prompt`, because the runner needs it. Run events, outbox messages, and errors never copy it. No secrets are written to the database. `*.db`, `*.db-wal`, and `*.db-shm` are git-ignored.
+- **Outbox:** messages are stored, not sent. A sender lists deliverable messages (oldest pending per run), then must call `claimMessage` immediately before posting; it refuses if the run was cancelled in the meantime. Long bodies go through `enqueueMessageParts`. Failures are recorded as fixed reason codes, never free text. Bodies may contain provider output: the sender must escape Slack markup (see the doc comment on `enqueueMessage`).
 - **Journal mode:** WAL, with `foreign_keys = ON`, `busy_timeout = 5000`, and `synchronous = FULL`. Opening fails if WAL cannot be enabled.
 - **Schema versioning:** tracked with `PRAGMA user_version` and forward-only migrations in `src/store/schema.ts`. A database with a newer version than the code supports is refused.
 - **Guarantees enforced in the schema:** unique `(team, event_id)` and `(team, channel, message_ts)`; one run per `(team, channel, root thread)`; immutable binding columns; append-only events, approvals, and inbound events; no outbox destination columns.

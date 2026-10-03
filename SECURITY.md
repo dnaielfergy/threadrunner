@@ -66,6 +66,7 @@ This project reduces accidental and unauthorized invocation. It does **not** eli
 - Risk from a compromised Slack account or session.
 - Risk from a compromised local macOS account.
 - Prompt injection from repository content, issue text, web pages, or files.
+- A cancellation that lands after the outbox sender has claimed a message but before its network request completes: that one in-flight message cannot be recalled.
 - Vulnerabilities in provider CLIs, dependencies, or the bridge itself.
 - An agent making incorrect changes even with valid authorization.
 
