@@ -3,7 +3,8 @@ import { stderrLogger } from "./log.js";
 import { installCrashHandlers, shutdown } from "./process-guard.js";
 import { createSlackApi, createSocketTransport } from "./sdk.js";
 
-const SHUTDOWN_TIMEOUT_MS = 10_000;
+// Longer than the 15 second post request timeout, so a hung post times out and is recorded before we give up.
+const SHUTDOWN_TIMEOUT_MS = 20_000;
 
 installCrashHandlers(process, stderrLogger, (code) => process.exit(code));
 

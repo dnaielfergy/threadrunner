@@ -82,7 +82,7 @@ Run the bridge under a supervisor (launchd, systemd) that restarts it on a non-z
 - `send_deferred:network` / `send_deferred:rate_limited`: Slack was unreachable or busy. The reply stays queued and is retried (up to about 30 minutes of trouble, honoring `Retry-After`) without using up its attempts, including across a restart.
 - `reject:<reason>`, `parse:<code>`: why an incoming event was dropped.
 
-On SIGINT or SIGTERM it stops receiving, finishes the reply being posted, closes the database, and exits (non-zero if that fails, and forced within 10 seconds).
+On SIGINT or SIGTERM it stops receiving, finishes the reply being posted, closes the database, and exits (non-zero if that fails, and forced within 20 seconds).
 
 ## Roadmap
 
