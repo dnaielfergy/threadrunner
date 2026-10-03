@@ -104,7 +104,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md). Every pull request that adds or widens
 
 ## Development
 
-Requires Node 20+.
+Requires Node 22+.
 
 ```bash
 npm install
