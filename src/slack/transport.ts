@@ -34,7 +34,14 @@ export interface PostMessageRequest {
   readonly unfurl_media: false;
 }
 
-export type PostResult = { readonly ok: true } | { readonly ok: false; readonly reason: OutboxFailureReason };
+export type PostResult =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly reason: OutboxFailureReason;
+      /** Seconds Slack asked us to wait (rate limits only). A number read from the SDK error; never its text. */
+      readonly retryAfterSeconds?: number | undefined;
+    };
 
 export interface SlackApi {
   /** Who the bot token belongs to. Used once at startup to check the workspace. */

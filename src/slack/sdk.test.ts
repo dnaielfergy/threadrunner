@@ -31,7 +31,8 @@ vi.mock("@slack/socket-mode", () => ({
   },
 }));
 
-const { createSlackApi, createSocketTransport, createWebClient, failureReason } = await import("./sdk.js");
+const { createSlackApi, createSocketTransport, createWebClient, failureReason, retryAfterSeconds } = await import("./sdk.js");
+const { capturingLogger } = await import("./test-fixtures.js");
 
 const request = {
   channel: "D0AAAAAAA",
@@ -97,17 +98,33 @@ describe("web client", () => {
 });
 
 describe("socket transport", () => {
-  it("connects with the app token, a silent logger and no SDK retries", async () => {
-    const transport = createSocketTransport("xapp-1-test-token-0123456789");
+  it("connects with the app token and a silent logger, keeping the SDK's default retry policy so reconnects survive a network blip", async () => {
+    const transport = createSocketTransport("xapp-1-test-token-0123456789", capturingLogger().log);
     await transport.start(async () => {});
     const [client] = socketClients;
-    expect(client?.options).toMatchObject({ appToken: "xapp-1-test-token-0123456789", clientOptions: { retryConfig: { retries: 0 } } });
+    expect(client?.options).toMatchObject({ appToken: "xapp-1-test-token-0123456789", clientOptions: { timeout: 15000 } });
+    // Setting retries to 0 here would make a single failed apps.connections.open end the reconnect loop.
+    expect(client?.options["clientOptions"]).not.toHaveProperty("retryConfig");
     expect(client?.start).toHaveBeenCalledOnce();
-    expect([...(client?.listeners.keys() ?? [])]).toEqual(["slack_event"]);
+    expect(client?.listeners.has("slack_event")).toBe(true);
+  });
+
+  it.each([
+    ["connected", "info", "socket_connected"],
+    ["reconnecting", "warn", "socket_reconnecting"],
+    ["disconnected", "warn", "socket_disconnected"],
+    ["error", "error", "socket_error"],
+  ])("logs a %s state change as the fixed code %s, never the payload", async (name, level, code) => {
+    const { log, entries } = capturingLogger();
+    const transport = createSocketTransport("xapp-1-test-token-0123456789", log);
+    await transport.start(async () => {});
+    socketClients[0]?.listeners.get(name)?.(new Error("wss://wss-primary.slack.com/?ticket=SECRET-CANARY"));
+    expect(entries).toEqual([{ level, code }]);
+    expect(JSON.stringify(entries)).not.toContain("CANARY");
   });
 
   it("hands every envelope to the handler with a working ack", async () => {
-    const transport = createSocketTransport("xapp-1-test-token-0123456789");
+    const transport = createSocketTransport("xapp-1-test-token-0123456789", capturingLogger().log);
     const received: { type: string; body: unknown }[] = [];
     let ackedWith: unknown;
     await transport.start(async (envelope) => {
@@ -122,9 +139,30 @@ describe("socket transport", () => {
   });
 
   it("stop disconnects", async () => {
-    const transport = createSocketTransport("xapp-1-test-token-0123456789");
+    const transport = createSocketTransport("xapp-1-test-token-0123456789", capturingLogger().log);
     await transport.start(async () => {});
     await transport.stop();
     expect(socketClients[0]?.disconnect).toHaveBeenCalledOnce();
+  });
+});
+
+describe("retryAfterSeconds", () => {
+  const limited = (retryAfter: unknown) => Object.assign(new Error("ratelimited"), { code: "slack_webapi_rate_limited_error", retryAfter });
+
+  it("reads only a positive finite number from a rate-limit error", () => {
+    expect(retryAfterSeconds(limited(30))).toBe(30);
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, "30", undefined, null]) expect(retryAfterSeconds(limited(bad))).toBeUndefined();
+  });
+
+  it("ignores other error kinds and non-errors", () => {
+    expect(retryAfterSeconds(Object.assign(new Error("x"), { code: "slack_webapi_http_error", retryAfter: 30 }))).toBeUndefined();
+    expect(retryAfterSeconds("boom")).toBeUndefined();
+    expect(retryAfterSeconds(null)).toBeUndefined();
+  });
+
+  it("is passed through the failed post result", async () => {
+    const api = createSlackApi("xoxb-test-token-0123456789");
+    webClients[0]?.postMessage.mockRejectedValueOnce(limited(42));
+    expect(await api.postMessage(request)).toEqual({ ok: false, reason: "rate_limited", retryAfterSeconds: 42 });
   });
 });

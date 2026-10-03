@@ -83,10 +83,18 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
   return {
     ok: true,
     store,
+    // Order matters: stop new envelopes first, then let the message being posted finish and be
+    // marked sent, and only then close the store. Closing first would lose the `markSent` and re-post it.
     stop: async () => {
-      sender.stop();
-      await transport.stop();
-      store.close();
+      try {
+        await transport.stop();
+      } finally {
+        try {
+          await sender.stop();
+        } finally {
+          store.close();
+        }
+      }
     },
   };
 }

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   MAX_OUTBOX_ATTEMPTS,
   MAX_OUTBOX_BODY_LENGTH,
@@ -10,7 +10,8 @@ import {
 } from "../store/index.js";
 import { BINDING, fakeClock, fakeIds, newRun, open, tempDbPath } from "../store/test-utils.js";
 import { buildPostRequest, escapeSlackText } from "./format.js";
-import { createSender } from "./sender.js";
+import { createSender, TRANSIENT_BUDGET_MS } from "./sender.js";
+import type { PostResult } from "./transport.js";
 import { TEAM, capturingLogger, fakeSlackApi } from "./test-fixtures.js";
 
 const EVIL = "<!channel> <!here> <@U0AAAAAAA> <#C0AAAAAAA> <https://evil.example|Click here> a&b &lt;ok&gt;";
@@ -34,7 +35,7 @@ describe("posting", () => {
     const ctx = setup();
     const run = ctx.makeRun();
     enqueueMessage(ctx.store, run.id, EVIL);
-    expect(await ctx.sender.drain()).toEqual({ sent: 1, failed: 0, skipped: 0 });
+    expect(await ctx.sender.drain()).toEqual({ sent: 1, failed: 0, deferred: 0, skipped: 0 });
     expect(ctx.api.posts).toEqual([
       {
         channel: BINDING.channelId,
@@ -89,7 +90,8 @@ describe("posting", () => {
     if (!queued.ok) throw new Error("setup");
     expect(await ctx.sender.drain()).toMatchObject({ sent: 0, failed: 1 });
     expect(ctx.api.posts).toEqual([]);
-    expect(getMessageStatus(ctx.store, queued.messageId)?.attempts).toBe(1);
+    // It can never succeed, so it is failed at once rather than spending retries.
+    expect(getMessageStatus(ctx.store, queued.messageId)?.status).toBe("failed");
   });
 
   it("never logs message bodies", async () => {
@@ -120,7 +122,7 @@ describe("cancellation races", () => {
     cancelB = () => void transitionRun(ctx.store, bBinding, "received", "cancelled");
 
     // B's message was listed, then cancelled while A's post was in flight: the claim refuses it.
-    expect(await ctx.sender.drain()).toEqual({ sent: 1, failed: 0, skipped: 1 });
+    expect(await ctx.sender.drain()).toEqual({ sent: 1, failed: 0, deferred: 0, skipped: 1 });
     expect(api.posts.map((p) => p.text)).toEqual(["message for A"]);
     expect(ctx.entries.map((e) => e.code)).toContain("claim_refused:not_pending");
     // Only the cancellation acknowledgement, created by the cancel itself, goes out afterwards.
@@ -139,22 +141,23 @@ describe("cancellation races", () => {
 });
 
 describe("failures", () => {
-  it.each(["rate_limited", "network", "slack_error", "unknown"] as const)("records a %s failure as a reason code and retries after a backoff", async (reason) => {
+  it.each(["slack_error", "unknown"] as const)("a %s failure uses an attempt, is recorded as a reason code, and retries after a backoff", async (reason) => {
     const ctx = setup(fakeSlackApi({ ok: false, reason }));
     const run = ctx.makeRun();
     const queued = enqueueMessage(ctx.store, run.id, "hello");
     if (!queued.ok) throw new Error("setup");
     expect(await ctx.sender.drain()).toMatchObject({ failed: 1 });
     expect(ctx.store.db.prepare("SELECT last_error FROM outbox_messages WHERE id = ?").get(queued.messageId)?.["last_error"]).toBe(reason);
+    expect(getMessageStatus(ctx.store, queued.messageId)?.attempts).toBe(1);
     expect(await ctx.sender.drain()).toMatchObject({ skipped: 1, failed: 0 });
     expect(ctx.api.posts).toHaveLength(1);
-    ctx.clock.advance(3000);
+    ctx.clock.advance(5000);
     await ctx.sender.drain();
     expect(ctx.api.posts).toHaveLength(2);
   });
 
-  it("gives up after the attempt limit", async () => {
-    const ctx = setup(fakeSlackApi({ ok: false, reason: "network" }));
+  it("gives up after the attempt limit for non-transient failures", async () => {
+    const ctx = setup(fakeSlackApi({ ok: false, reason: "slack_error" }));
     const run = ctx.makeRun();
     const queued = enqueueMessage(ctx.store, run.id, "hello");
     if (!queued.ok) throw new Error("setup");
@@ -164,6 +167,93 @@ describe("failures", () => {
     }
     expect(ctx.api.posts).toHaveLength(MAX_OUTBOX_ATTEMPTS);
     expect(getMessageStatus(ctx.store, queued.messageId)?.status).toBe("failed");
+  });
+
+  describe("network and rate-limit failures (laptop sleep, Wi-Fi drop)", () => {
+    function flaky() {
+      let result: PostResult = { ok: false, reason: "network" };
+      const api = fakeSlackApi(() => result);
+      return { api, set: (next: PostResult) => void (result = next) };
+    }
+
+    it("do not use up attempts inside the time budget, and the message is delivered once the network returns", async () => {
+      const net = flaky();
+      const ctx = setup(net.api);
+      const queued = enqueueMessage(ctx.store, ctx.makeRun().id, "Queued as run-aaa1.");
+      if (!queued.ok) throw new Error("setup");
+
+      // About 25 minutes of outage (5 tries, each after the 5 minute cap), inside the 30 minute budget.
+      for (let i = 0; i < 5; i++) {
+        expect(await ctx.sender.drain()).toMatchObject({ deferred: 1, failed: 0 });
+        ctx.clock.advance(5 * 60_000);
+      }
+      expect(getMessageStatus(ctx.store, queued.messageId)).toMatchObject({ status: "pending", attempts: 0 });
+
+      net.set({ ok: true });
+      expect(await ctx.sender.drain()).toMatchObject({ sent: 1 });
+      expect(getMessageStatus(ctx.store, queued.messageId)?.status).toBe("sent");
+    });
+
+    it("stay pending in the database, so a restart does not lose the message", async () => {
+      const net = flaky();
+      const first = setup(net.api);
+      const queued = enqueueMessage(first.store, first.makeRun().id, "hello");
+      if (!queued.ok) throw new Error("setup");
+      await first.sender.drain();
+      // A new sender (a restart) has no in-memory state and simply tries again.
+      const second = createSender({ store: first.store, api: fakeSlackApi(), teamId: TEAM, log: capturingLogger().log, now: () => 5_000_000 });
+      expect(await second.drain()).toMatchObject({ sent: 1 });
+    });
+
+    it("start using attempts only after the budget is spent", async () => {
+      const ctx = setup(flaky().api);
+      const queued = enqueueMessage(ctx.store, ctx.makeRun().id, "hello");
+      if (!queued.ok) throw new Error("setup");
+      await ctx.sender.drain();
+      ctx.clock.advance(TRANSIENT_BUDGET_MS + 1);
+      expect(await ctx.sender.drain()).toMatchObject({ failed: 1, deferred: 0 });
+      expect(getMessageStatus(ctx.store, queued.messageId)?.attempts).toBe(1);
+    });
+
+    it("back off exponentially up to five minutes", async () => {
+      const ctx = setup(flaky().api);
+      enqueueMessage(ctx.store, ctx.makeRun().id, "hello");
+      const waits: number[] = [];
+      for (let i = 0; i < 8; i++) {
+        await ctx.sender.drain();
+        let waited = 0;
+        while ((await ctx.sender.drain()).skipped === 1) {
+          ctx.clock.advance(1000);
+          waited += 1000;
+          if (waited > 10 * 60_000) break;
+        }
+        waits.push(waited);
+      }
+      expect(waits[0]).toBeGreaterThanOrEqual(1000);
+      expect(waits.at(-1)).toBeLessThanOrEqual(5 * 60_000 + 1000);
+      expect(waits.at(-1)).toBeGreaterThan(waits[0] ?? 0);
+    });
+
+    it("honor Retry-After when Slack sends one", async () => {
+      const ctx = setup(fakeSlackApi({ ok: false, reason: "rate_limited", retryAfterSeconds: 120 }));
+      enqueueMessage(ctx.store, ctx.makeRun().id, "hello");
+      await ctx.sender.drain();
+      ctx.clock.advance(119_000);
+      expect(await ctx.sender.drain()).toMatchObject({ skipped: 1 });
+      expect(ctx.api.posts).toHaveLength(1);
+      ctx.clock.advance(1000);
+      await ctx.sender.drain();
+      expect(ctx.api.posts).toHaveLength(2);
+    });
+
+    it("cap an absurd Retry-After at fifteen minutes", async () => {
+      const ctx = setup(fakeSlackApi({ ok: false, reason: "rate_limited", retryAfterSeconds: 86_400 }));
+      enqueueMessage(ctx.store, ctx.makeRun().id, "hello");
+      await ctx.sender.drain();
+      ctx.clock.advance(15 * 60_000);
+      await ctx.sender.drain();
+      expect(ctx.api.posts).toHaveLength(2);
+    });
   });
 
   it("a throwing transport is recorded as `unknown`, never propagated or logged", async () => {
@@ -184,6 +274,7 @@ describe("failures", () => {
     enqueueMessage(tight.store, run.id, "&".repeat(20)); // escapes to 100 characters
     expect(await tight.sender.drain()).toMatchObject({ sent: 0, failed: 1 });
     expect(tight.api.posts).toEqual([]);
+    expect(tight.store.db.prepare("SELECT status FROM outbox_messages").get()?.["status"]).toBe("failed");
 
     const worst = "&".repeat(MAX_OUTBOX_BODY_LENGTH);
     expect(escapeSlackText(worst).length).toBe(MAX_OUTBOX_BODY_LENGTH * 5);
@@ -205,6 +296,52 @@ describe("failures", () => {
     const second = ctx.sender.drain();
     release();
     await Promise.all([first, second]);
+    expect(api.posts).toHaveLength(1);
+  });
+});
+
+describe("stop", () => {
+  it("waits for a post in flight and marks it sent, so shutdown cannot cause a re-post", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const api = fakeSlackApi(async () => {
+      await gate;
+      return { ok: true };
+    });
+    const ctx = setup(api);
+    const queued = enqueueMessage(ctx.store, ctx.makeRun().id, "in flight");
+    if (!queued.ok) throw new Error("setup");
+    const draining = ctx.sender.drain();
+    await vi.waitFor(() => expect(api.posts).toHaveLength(1));
+
+    let stopped = false;
+    const stopping = ctx.sender.stop().then(() => void (stopped = true));
+    await Promise.resolve();
+    expect(stopped).toBe(false); // still waiting on the post
+
+    release();
+    await Promise.all([draining, stopping]);
+    expect(stopped).toBe(true);
+    expect(api.posts).toHaveLength(1);
+    expect(getMessageStatus(ctx.store, queued.messageId)?.status).toBe("sent");
+  });
+
+  it("does not start another message after stop, and later drains do nothing", async () => {
+    let sender: ReturnType<typeof setup>["sender"] | undefined;
+    const api = fakeSlackApi(async () => {
+      void sender?.stop();
+      return { ok: true };
+    });
+    const ctx = setup(api);
+    sender = ctx.sender;
+    const a = ctx.makeRun();
+    const bBinding: Binding = { ...BINDING, rootThreadTs: "1700000070.000100" };
+    const b = ctx.makeRun({ ...bBinding, eventId: "Ev0AAAAAAA2", messageTs: bBinding.rootThreadTs });
+    enqueueMessage(ctx.store, a.id, "first");
+    enqueueMessage(ctx.store, b.id, "second");
+    await ctx.sender.drain();
+    expect(api.posts.map((p) => p.text)).toEqual(["first"]);
+    expect(await ctx.sender.drain()).toEqual({ sent: 0, failed: 0, deferred: 0, skipped: 0 });
     expect(api.posts).toHaveLength(1);
   });
 });

@@ -1,8 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { getRun } from "../store/index.js";
-import { fakeClock, fakeIds, tempDbPath } from "../store/test-utils.js";
+import { getMessageStatus, getRun } from "../store/index.js";
+import { fakeClock, fakeIds, open, tempDbPath } from "../store/test-utils.js";
 import { startBridge, type AppDeps } from "./app.js";
 import type { Envelope, SlackApi, SocketTransport } from "./transport.js";
 import { BOT_USER, DM, TEAM, USER, capturingLogger, dmMessage, eventOf, fakeEnvelope, fakeSlackApi } from "./test-fixtures.js";
@@ -94,5 +94,50 @@ describe("startBridge", () => {
     expect(ctx.api.posts[0]).toMatchObject({ channel: DM, thread_ts: ts, parse: "none" });
     await result.stop();
     expect(ctx.transport.stop).toHaveBeenCalledOnce();
+  });
+
+  it("shuts down in order: transport first, then the in-flight post is finished and marked sent, then the store closes", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const ctx = setup({}, {});
+    const order: string[] = [];
+    ctx.api.postMessage = async (request) => {
+      ctx.api.posts.push(request);
+      order.push("post_started");
+      await gate;
+      order.push("post_done");
+      return { ok: true };
+    };
+    vi.mocked(ctx.transport.stop).mockImplementation(async () => void order.push("transport_stopped"));
+
+    const result = await startBridge(ctx.deps);
+    if (!result.ok) throw new Error("expected start");
+    const handle = ctx.handler();
+    if (!handle) throw new Error("transport never started");
+    await handle(fakeEnvelope(dmMessage("/claude default investigate the failing build")));
+    await vi.waitFor(() => expect(order).toContain("post_started"));
+
+    let stopped = false;
+    const stopping = result.stop().then(() => void (stopped = true));
+    await vi.waitFor(() => expect(order).toContain("transport_stopped"));
+    expect(stopped).toBe(false); // waiting for the post
+
+    release();
+    await stopping;
+    expect(order).toEqual(["post_started", "transport_stopped", "post_done"]);
+    expect(ctx.api.posts).toHaveLength(1);
+
+    // The store was still open when the post finished: a fresh connection sees it marked sent.
+    const reopened = open(ctx.dbPath);
+    expect(getMessageStatus(reopened, 1)?.status).toBe("sent");
+  });
+
+  it("closes the store even if the transport fails to stop, and reports the failure", async () => {
+    const ctx = setup();
+    const result = await startBridge(ctx.deps);
+    if (!result.ok) throw new Error("expected start");
+    vi.mocked(ctx.transport.stop).mockRejectedValueOnce(new Error("socket hung"));
+    await expect(result.stop()).rejects.toThrow();
+    expect(() => result.store.db.prepare("SELECT 1").get()).toThrow();
   });
 });

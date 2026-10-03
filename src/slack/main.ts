@@ -1,11 +1,19 @@
 import { startBridge } from "./app.js";
 import { stderrLogger } from "./log.js";
+import { installCrashHandlers, shutdown } from "./process-guard.js";
 import { createSlackApi, createSocketTransport } from "./sdk.js";
+
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
+installCrashHandlers(process, stderrLogger, (code) => process.exit(code));
 
 const result = await startBridge({
   env: process.env,
   log: stderrLogger,
-  connect: ({ botToken, appToken }) => ({ api: createSlackApi(botToken), transport: createSocketTransport(appToken) }),
+  connect: ({ botToken, appToken }) => ({
+    api: createSlackApi(botToken),
+    transport: createSocketTransport(appToken, stderrLogger),
+  }),
 });
 
 if (!result.ok) {
@@ -18,7 +26,7 @@ if (!result.ok) {
 const { stop } = result;
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
-    void stop().finally(() => process.exit(0));
+    void shutdown(stop, { timeoutMs: SHUTDOWN_TIMEOUT_MS, log: stderrLogger, exit: (code) => process.exit(code) });
   });
 }
 stderrLogger({ level: "info", code: "bridge_started" });
