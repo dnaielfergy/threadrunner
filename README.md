@@ -66,7 +66,23 @@ npm start   # builds to dist/, then runs dist/slack/main.js with .env loaded
 @ThreadRunner /codex fast list the failing tests
 ```
 
+Usage: `/claude|/codex|/auto <fast|default|deep> <prompt>`. The model profile is required.
+
+- **Silence means it did not parse.** Anything that is not exactly a command (a missing profile, a typo, plain chat) is ignored with no reply, by design, so a typo looks the same as an outage. Check the format first, then the bridge's stderr (it logs a `parse:<code>` reason, never your text).
+- **The Slack client may intercept a leading `/` in a DM.** If it says the command is not valid, choose the **send as message** option it offers, or mention the bot first (`@ThreadRunner /claude default ...`), which works everywhere.
+
 Then reply **in that thread** with `/status` or `/cancel`. `/approve run-<id>` is recognized but does nothing yet.
+
+### Running it
+
+Run the bridge under a supervisor (launchd, systemd) that restarts it on a non-zero exit. The bridge logs one JSON line per event on stderr, with fixed codes only:
+
+- `socket_connected`, `socket_reconnecting`, `socket_disconnected`, `socket_error`: connection state. Wi-Fi drops and sleep/wake are retried by the Slack SDK. Missing `socket_connected` after start means the bridge is not receiving.
+- `unhandled_rejection`, `uncaught_exception`: the bridge exits 1 so the supervisor restarts it.
+- `send_deferred:network` / `send_deferred:rate_limited`: Slack was unreachable or busy. The reply stays queued and is retried (up to about 30 minutes of trouble, honoring `Retry-After`) without using up its attempts, including across a restart.
+- `reject:<reason>`, `parse:<code>`: why an incoming event was dropped.
+
+On SIGINT or SIGTERM it stops receiving, finishes the reply being posted, closes the database, and exits (non-zero if that fails, and forced within 10 seconds).
 
 ## Roadmap
 
