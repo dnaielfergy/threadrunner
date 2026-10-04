@@ -137,8 +137,8 @@ No edits, commits, pushes, worktrees, approvals (`/approve` stays inert), other 
 | Stage | Capability | Safety posture |
 |---|---|---|
 | v0.1 | Slack Socket Mode, one authorized user, bot DM, local Codex runner, final thread reply | Read-only task execution |
-| v0.2 | Claude runner, `/auto`, SQLite run log, cancellation, deduplication | One active run, explicit provider selection |
-| v0.3 | Approval-gated edits, disposable Git worktrees, diff/test summaries | No commits/pushes/deploys |
+| v0.2 | Approval-gated edits, disposable Git worktrees, diff/test summaries | No commits/pushes/deploys |
+| v0.3 | Claude runner, `/auto`, SQLite run log, cancellation, deduplication | One active run, explicit provider selection |
 | v0.4 | Commit/PR actions with named confirmations, multiple repos | Per-repo locks and branch protections |
 | v0.5 | Pluggable runners and portable deployment to Linux/WSL | Dedicated runner account/machine |
 | Later | Optional schedules, web UI, richer artifact handling | Separate threat-model review per feature |

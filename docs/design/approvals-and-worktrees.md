@@ -300,12 +300,12 @@ Design rules that hold whatever the exact format turns out to be:
 
 ## Required amendments
 
-These change documents that outrank this one. None is made by this document; each needs the owner's approval.
+These changed documents that outrank this one. The owner approved items 1 to 4; they are applied.
 
-1. **security-architecture.md, run state model:** add `validated -> awaiting_approval` for edit-mode tasks.
-2. **security-architecture.md, invariant 6:** "dedicated worktree rooted under a configured repository path" becomes "under a configured worktree root".
-3. **Issue #6, first acceptance criterion:** "Read-only runs can enter `awaiting_approval`" becomes "edit-mode tasks enter `awaiting_approval` directly; the read-only to approval edge is kept for a future plan mode".
-4. **ROADMAP.md and README disagree** on order: ROADMAP.md puts approvals and worktrees in v0.2 and the Claude runner in v0.3; the README table puts the Claude runner in v0.2. One should be corrected.
+1. **security-architecture.md, run state model:** added `validated -> awaiting_approval` for edit-mode tasks. Applied.
+2. **security-architecture.md, invariant 6:** now reads "under a configured worktree root". Applied.
+3. **Issue #6, first acceptance criterion:** now reads "edit-mode tasks enter `awaiting_approval` directly; the read-only to approval edge is kept for a future plan mode". Applied on the issue.
+4. **ROADMAP.md and README disagreed** on order. The README table now matches ROADMAP.md: approvals and worktrees in v0.2, the Claude runner in v0.3. Applied.
 5. **SECURITY.md:** `EDIT_CHANNEL_IDS` is the concrete form of the per-channel `max_privilege` in its configuration reference. No text change is required unless the owner wants it spelled out.
 
 ## Open questions
