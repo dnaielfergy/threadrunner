@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tempDir } from "../store/test-utils.js";
@@ -46,9 +46,11 @@ describe("createNodeLauncher", () => {
     expect(raw).not.toContain("CANARY");
     const seen = Object.keys(JSON.parse(raw) as Record<string, string>);
     expect(seen).not.toEqual(expect.arrayContaining(["SLACK_BOT_TOKEN"]));
-    // Node itself may add a few variables to the child; the point is that nothing from the parent beyond the allowlist is there.
+    // The operating system or Node adds a few variables to every process (macOS adds __CF_USER_TEXT_ENCODING,
+    // a shell adds PWD and friends). They do not come from the parent's environment, which the canary checks above cover.
     const allowed = new Set(["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR"]);
-    const unexpected = seen.filter((name) => !allowed.has(name) && !["PWD", "SHLVL", "_", "OLDPWD"].includes(name));
+    const addedByTheSystem = ["PWD", "SHLVL", "_", "OLDPWD", "__CF_USER_TEXT_ENCODING"];
+    const unexpected = seen.filter((name) => !allowed.has(name) && !addedByTheSystem.includes(name));
     expect(unexpected).toEqual([]);
   });
 
@@ -63,7 +65,8 @@ describe("createNodeLauncher", () => {
   it("starts the child in the given working directory", async () => {
     const outcome = await supervise({ ...options, spec: spec("argv") });
     const seen = JSON.parse(outcome.kind === "exited" ? outcome.output : "{}") as { cwd: string };
-    expect(seen.cwd).toBe(dir);
+    // A process reports its real directory; on macOS the temp directory is reached through a /var -> /private/var symlink.
+    expect(realpathSync(seen.cwd)).toBe(realpathSync(dir));
   });
 
   it("discards standard error: it never reaches the output", async () => {
