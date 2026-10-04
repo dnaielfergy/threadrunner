@@ -29,6 +29,7 @@ ThreadRunner's main purpose is to start CLI agents that already exist on the own
 | 5 | Cleanup | **Automatic retention plus manual removal.** No `/discard` command. |
 | 6 | Dirty checkout | **Proceed**, and the approval request says uncommitted changes are not included. |
 | 7 | What is an agent? | **Standard agent structures: Markdown files in an agent folder, each with a goal, skills, and tools.** See section 14. |
+| 8 | Linked worktree or standalone clone? | **Linked worktree**, decided by the spike (section 12): the sandbox protected `.git` and blocked commits in both, so the clone adds nothing observed. |
 
 ## 3. Flow and state machine
 
@@ -132,10 +133,10 @@ All bridge-run git goes through a single module, using the existing `Launcher` i
 - Acceptance tests use a deliberately hostile repository (section 11): a canary command planted as a hook, as `core.fsmonitor`, as a filter driver, and via an overwritten `.git` pointer must never run.
 
 ### 6.4 Confinement
-The write sandbox's writable area is expected to be the worktree only, so the main repository's `.git` (hooks, config, objects) is outside it and the process cannot commit or alter repository configuration. This is an expectation to verify, not an assumption. If the spike shows the common git directory is writable from the sandbox, or that git cannot work inside a linked worktree under the sandbox, the fallback in 6.5 applies.
+Observed in the spike (section 12; codex-cli 0.160.0, macOS, `--ignore-user-config`): under `--sandbox workspace-write --cd <linked worktree>` the process could write inside the worktree, could not write into the main repository's `.git` ("permission denied"), could not create a commit (git exited 128), and could run `git status`. The sandbox is therefore the control that prevents commits and changes to the repository's git directory, and the design relies on it as observed, with the bridge-side hardening in 6.3 as defense in depth. Not tested: whether the sandbox also protects an overwritten `.git` pointer file inside the worktree. The bridge does not depend on that, because it names the git directory explicitly.
 
 ### 6.5 Fallback: isolated clone instead of a linked worktree
-A local clone in `WORKTREE_ROOT` has its own `.git`, so nothing the sandbox writes can reach the owner's repository, and git works fully inside the sandbox. Costs: a copy of the objects, and a later commit/PR phase must fetch from the clone. Branch naming and the rest of the design are unchanged. Chosen after the spike.
+A local clone in `WORKTREE_ROOT` has its own `.git`. The spike showed the same sandbox behavior for a clone (`.git` protected, commit blocked), so it adds no observed protection and costs a copy of the objects. Not used. Kept as the fallback if a later Codex version changes how `workspace-write` treats `.git` in a linked worktree; re-run Part B after Codex upgrades.
 
 ### 6.6 One write run per repository
 Invariant 7 is enforced in the database, not only in code: a partial unique index over `running_write`, so two runs can never be operating on the repository at once. `queued_write` is deliberately not in the index: a second approved run waits there (still subject to expiry) until the first finishes. With a single configured repository the key is a constant; it becomes `repo_id` when multiple repositories exist.
@@ -207,7 +208,7 @@ Grammar becomes `/codex|/claude|/auto <fast|default|deep> [--edit] <prompt>`. `-
 | T10 | Two writers in one repository | Database partial unique index on `running_write` | Two approved runs: one runs, one waits in `queued_write`; raw SQL for a second `running_write` fails |
 | T11 | Secrets or large content in Slack | Names and counts only; capped lists; no hunks; escaping by the existing sender | Large diff, hostile file names |
 | T12 | Disk exhaustion | Retention and a retained-worktree cap | Cap refusal test |
-| T13 | Residual: write process reads credentials under `HOME` | No network expected in the sandbox (verify); no credentials in the environment; documented, same class as the read-only runner | Spike |
+| T13 | **Read access outside the working directory (confirmed).** The spike showed the write sandbox let Codex read a file outside its directory. A prompt-injected instruction can make it print that content in its reply, which the bridge posts to Slack. | The bridge cannot restrict reads. Run the bridge under a dedicated OS user that holds no keys or credentials (SECURITY.md already recommends this); no credentials in the child's environment; network appeared disabled in the sandbox (DNS failed), which blocks exfiltration from inside it but not through the reply; consider best-effort secret redaction of replies, which cannot be complete | Spike Part B; a test that replies are bounded and escaped (existing) |
 
 ## 12. Spike before implementation (needs the owner's machine and real Codex)
 
@@ -239,7 +240,24 @@ What this confirms and changes:
 - `--numstat` did not run `textconv`; the patch form did. The bridge never needs the patch form, so it should not run it.
 - The user's global git configuration can define filters too (this machine had git-lfs). The bridge's git environment disables global and system configuration.
 
-**Part B (real Codex)** has not been run yet. Pending: whether the `workspace-write` sandbox can write into the main repository's `.git`, make a commit, run `git status`, reach the network, or read a file outside the working directory, in a linked worktree and in a standalone clone. This decides 6.4 versus 6.5.
+**Part A on macOS** (Git 2.50.1, Apple Git-155) gave results identical to the Linux table above: every planted command ran under plain git and every hardening switch stopped it.
+
+**Part B (real Codex, codex-cli 0.160.0, macOS, `--sandbox workspace-write --ignore-user-config`).** Evidence comes from the filesystem, not from what the agent reported.
+
+| Probe | Linked worktree | Standalone clone |
+|---|---|---|
+| Write inside the working directory | works | works |
+| Write into the repository's `.git` | denied | denied (the clone's own `.git`, inside the working directory) |
+| `git status` | works (exit 0) | works (exit 0) |
+| `git commit` | fails (exit 128), no new commit | fails (exit 128), no new commit |
+| Network (`curl https://example.com`) | `Could not resolve host` | `Could not resolve host` |
+| Read a file outside the working directory | **succeeded** | **succeeded** |
+
+Conclusions:
+- Use the linked worktree (decision 8). The sandbox protects `.git` and blocks commits in both layouts.
+- Network looks disabled by default: DNS resolution failed. A direct connection by IP address was not tested, so "disabled" is not yet proven.
+- **Reads are not confined.** The sandbox restricted writes only. See T13. This probably applies to the read-only runner too (not tested; the quick check is in the PR discussion).
+- Not tested: overwriting the worktree's `.git` pointer file from inside the sandbox; the structured final message option `--output-schema`.
 
 ## 13. Implementation slices
 
@@ -273,6 +291,6 @@ These change documents that outrank this one. None is made by this document; eac
 
 ## Open questions
 
-1. **Linked worktree or isolated clone?** Decided by Part B of the spike (6.4 versus 6.5).
-2. **Agents (section 14):** location, naming, an example file, and whether both CLIs use the same files.
-3. **macOS Git:** Part A needs to be run on the owner's machine, since the installed Git version may differ from the 2.43.0 used so far.
+1. **Agents (section 14):** folder location, naming, an example file, and whether both CLIs use the same files.
+2. **Read confinement:** is a dedicated OS user for the runner acceptable as the requirement before edit mode is used on a real repository, or should the design also include a best-effort secret redaction pass on replies?
+3. **Read-only runner:** confirm with the quick check that the already-merged read-only mode also reads outside its directory, and decide whether to add a line to the waiver on #22.
