@@ -73,7 +73,7 @@ This needs a real Slack app and a real Codex install, so the Slack and Codex ste
    - **Do not point `APPROVED_REPO_ROOTS` at the ThreadRunner checkout.** The checkout holds `.env` with your Slack tokens, and a Codex run can read what its sandbox allows inside the repository. This is advice, not a startup check: startup refuses only the filesystem root, your home directory itself, and a directory that contains the database file.
    - **The sandbox must not contain the database file.** Startup refuses a root that contains `DATABASE_PATH`, because a run could read stored prompts. Keep the database in `~/.threadrunner/` or another directory outside any git repository.
 
-4. Run `npm start`. Look for `socket_connected` and `bridge_started` on stderr. Then DM the bot, starting the message with the mention: `@ThreadRunner /codex fast list the files here`.
+4. Run `npm start`. Look for `socket_connected` and `bridge_started` on stderr. Then, in the allowlisted channel, send `@ThreadRunner /codex fast list the files here`. A message from a channel that is not in `ALLOWED_CHANNEL_IDS` is dropped and logs `reject:wrong_channel`; that includes your DM with the bot unless its `D...` ID is listed.
 
 Stop the bridge with Ctrl+C. Deleting the sandbox directory and the database file resets everything.
 

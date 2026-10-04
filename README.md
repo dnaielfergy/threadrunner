@@ -69,7 +69,7 @@ npm start   # builds to dist/, then runs dist/slack/main.js with .env loaded
 Usage: `/claude|/codex|/auto <fast|default|deep> <prompt>`. The model profile is required.
 
 - **Silence means it did not parse.** Anything that is not exactly a command (a missing profile, a typo, plain chat) is ignored with no reply, by design, so a typo looks the same as an outage. Check the format first, then the bridge's stderr (it logs a `parse:<code>` reason, never your text).
-- **Start every command with `@ThreadRunner`**, in a DM or a channel (`@ThreadRunner /claude default ...`). The Slack client blocks a bare leading `/` before the bridge sees it, and there is no workaround, so do not rely on one.
+- **Start every command with `@ThreadRunner`** (`@ThreadRunner /claude default ...`). Use the allowlisted channel; a DM works only if its `D...` ID is also in `ALLOWED_CHANNEL_IDS`, and the mention form in a DM has not been verified. The Slack client blocks a bare leading `/` before the bridge sees it, and there is no workaround, so do not rely on one.
 
 Then reply **in that thread** with `/status` or `/cancel`. `/approve run-<id>` is recognized but does nothing yet.
 
@@ -211,7 +211,7 @@ Find the IDs in Slack: your member ID under your profile > **Copy member ID**; t
 
 Only `message.im` (a DM) and `app_mention`, from the one allowlisted user, in an allowlisted channel, in the allowlisted workspace. Bot and system messages, message subtypes (edits, deletes, joins), file uploads, shared or Slack Connect channels, external users, and ambient channel messages are dropped with no reply. Dropped events log a reason code and the event ID, never message text.
 
-**Commands are text, not Slack slash commands.** The text `/claude default ...` is parsed by the bridge. Registered Slack slash commands arrive as a different envelope type with no thread and no event ID, which cannot be bound to a run, so they are deliberately unsupported. Because the Slack client also treats a leading `/` as a slash command, it blocks a message that starts with `/` before the bridge sees it. Start every command with `@ThreadRunner` (`@ThreadRunner /claude default ...`), in a DM or a channel; the bridge strips the mention. Do not rely on any other workaround.
+**Commands are text, not Slack slash commands.** The text `/claude default ...` is parsed by the bridge. Registered Slack slash commands arrive as a different envelope type with no thread and no event ID, which cannot be bound to a run, so they are deliberately unsupported. Because the Slack client also treats a leading `/` as a slash command, it blocks a message that starts with `/` before the bridge sees it. Start every command with `@ThreadRunner` (`@ThreadRunner /claude default ...`) in the allowlisted channel; the bridge strips the mention of an `app_mention` event. A message from a channel that is not in `ALLOWED_CHANNEL_IDS`, a DM included, is dropped and logs `reject:wrong_channel`. Whether a mention typed in a DM works has not been verified, because the bridge strips the mention only for `app_mention` events. Do not rely on any other workaround.
 
 ### 5. Rotating tokens
 
