@@ -274,7 +274,7 @@ Each slice is a separate PR, none enables writing until slice 4, and edit mode s
    - The trusted git directory for a worktree comes from the main repository's own record of it (`.git/worktrees/<run-id>/gitdir`, which the sandbox cannot write), never from the pointer file inside the worktree.
    - The summary lists new untracked files without line counts (counting would mean reading contents the agent controls). Counts for tracked text files come from `git diff --numstat` against the base commit.
    - Not in this slice, left for slice 5: the scheduled sweep that applies retention and the run-state conditions in 6.7, startup recovery, and wiring any of this into the runner.
-4. **Write runner and summary.** This is the first slice that starts a process with write access, so the #22-style live checklist applies before it merges: a live edit in a throwaway repo, cancel mid-run, kill-and-restart, and a hostile-repository run.
+4. **Write runner and summary.** *Code done; live checklist not yet run* (`docs/design/spikes/edit-runner-live-checklist.md`). This is the first slice that starts a process with write access, so the #22-style live checklist applies before it merges: a live edit in a throwaway repo, cancel mid-run, kill-and-restart, and a hostile-repository run.
 5. **Sweep, recovery, caps, and configuration validation.**
 
 ## 14. Agents (input recorded, mechanism not yet designed)

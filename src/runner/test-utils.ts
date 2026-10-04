@@ -75,7 +75,7 @@ export function mockLauncher(options: MockLauncherOptions = {}) {
   return { launcher, calls, state };
 }
 
-export type FakeMode = "echo" | "env" | "argv" | "sleep" | "tree" | "flood" | "exit3" | "stderr";
+export type FakeMode = "echo" | "env" | "argv" | "sleep" | "tree" | "flood" | "exit3" | "stderr" | "write" | "pointer";
 
 /**
  * Write a fake provider executable. Behaviour is chosen by its first argument; the second is a file
@@ -88,7 +88,7 @@ export function writeFakeCli(dir = tempDir()): string {
 const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const [mode, marker] = process.argv.slice(2);
-if (marker) fs.appendFileSync(marker, "invoked " + process.pid + "\\n");
+if (marker && mode !== "pointer") fs.appendFileSync(marker, "invoked " + process.pid + "\\n");
 let input = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (d) => (input += d));
@@ -96,6 +96,8 @@ process.stdin.on("end", () => {
   if (mode === "echo") { process.stdout.write(${JSON.stringify(OUTPUT_CANARY)} + " stdin=" + input.length + "\\n"); process.exit(0); }
   if (mode === "env") { process.stdout.write(JSON.stringify(process.env)); process.exit(0); }
   if (mode === "argv") { process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd(), input })); process.exit(0); }
+  if (mode === "write") { fs.writeFileSync("new-file.txt", "made by the agent\\n"); fs.appendFileSync("a.txt", "agent line\\n"); process.stdout.write("I added new-file.txt and edited a.txt. Tests pass.\\n"); process.exit(0); }
+  if (mode === "pointer") { fs.writeFileSync(".git", "gitdir: " + marker + "\\n"); fs.appendFileSync("a.txt", "agent line\\n"); process.stdout.write("done\\n"); process.exit(0); }
   if (mode === "exit3") { process.stdout.write("partial before failure\\n"); process.exit(3); }
   if (mode === "stderr") { process.stderr.write("STDERR-CANARY-77aa\\n"); process.stdout.write("ok\\n"); process.exit(0); }
   if (mode === "flood") { const chunk = "x".repeat(1000) + "\\n"; const t = setInterval(() => { for (let i = 0; i < 20; i++) process.stdout.write(chunk); }, 1); t.unref; return; }

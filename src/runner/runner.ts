@@ -1,13 +1,23 @@
 import type { ModelProfile } from "../domain/types.js";
 import type { AuthConfig } from "../slack/config.js";
 import type { Logger } from "../slack/log.js";
-import { enqueueMessageParts, expireStaleApprovals, getRun, listRunsByState, transitionRun, type Run, type Store } from "../store/index.js";
+import { enqueueMessageParts, expireStaleApprovals, getRun, getWorktree, listRunsByState, transitionRun, type Run, type Store } from "../store/index.js";
 import { buildChildEnv } from "./env.js";
 import { CANCEL_POLL_MS, MAX_OUTPUT_BYTES } from "./limits.js";
-import { APPROVAL_EXPIRED_NOTICE, APPROVED_EXPIRED_NOTICE, completionBody, failureBody, type FailureReason } from "./messages.js";
+import type { Git } from "./git.js";
+import {
+  APPROVAL_EXPIRED_NOTICE,
+  APPROVED_EXPIRED_NOTICE,
+  completionBody,
+  failureBody,
+  writeCompletionBody,
+  writeFailureBody,
+  type FailureReason,
+} from "./messages.js";
 import type { Launcher, LaunchSpec } from "./process.js";
 import { repoRootStillValid } from "./repo-root.js";
 import { supervise, type Outcome } from "./supervise.js";
+import { createWorktree, summarizeWorktree, type CreateWorktreeError, type WorktreeDeps } from "./worktree.js";
 
 /** What the provider-specific module decides: the arguments and what goes to standard input. */
 export interface Invocation {
@@ -15,6 +25,20 @@ export interface Invocation {
   readonly stdin: string;
 }
 export type BuildInvocation = (input: { readonly prompt: string; readonly profile: ModelProfile; readonly repoRoot: string }) => Invocation;
+
+export type BuildWriteInvocation = (input: { readonly prompt: string; readonly worktree: string }) => Invocation;
+
+/** Present only when edit mode is enabled. Without it, an approved run is failed rather than started. */
+export interface RunnerEditDeps {
+  readonly git: Git;
+  readonly worktreeRoot: string;
+  readonly maxRetained: number;
+  /** Wall-clock limit for one edit run. */
+  readonly timeoutMs: number;
+  /** Channels where edit runs may start: re-checked against the stored run before anything is created. */
+  readonly channelIds: ReadonlySet<string>;
+  readonly buildInvocation: BuildWriteInvocation;
+}
 
 export interface RunnerDeps {
   readonly store: Store;
@@ -34,6 +58,7 @@ export interface RunnerDeps {
   readonly pollMs?: number;
   /** Set when edit mode is enabled: approvals that were never given, or never started, are failed on this schedule. */
   readonly approvalTtlMs?: number;
+  readonly edit?: RunnerEditDeps;
 }
 
 export type TickResult = "idle" | "busy" | "stopped" | "ran";
@@ -52,7 +77,7 @@ export interface Runner {
 }
 
 /**
- * Single-slot worker for read-only Codex runs.
+ * Single-slot worker for Codex runs: read-only runs, and approved edit runs in their own worktree.
  *
  * Every state change goes through `transitionRun` with the state the runner believes the run is in,
  * so a run that was cancelled (or anything else) in the meantime is never overwritten, and a run
@@ -188,6 +213,140 @@ export function createRunner(deps: RunnerDeps): Runner {
     }
   }
 
+  const worktreeDeps = (edit: RunnerEditDeps): WorktreeDeps => ({
+    store,
+    git: edit.git,
+    repoRoot: deps.repoRoot,
+    worktreeRoot: edit.worktreeRoot,
+    maxRetained: edit.maxRetained,
+  });
+
+  /** Fail an edit run. The worktree, if one exists, is kept; the message says how many files had changed. */
+  async function failWrite(run: Run, from: "queued_write" | "running_write", reason: FailureReason): Promise<void> {
+    if (authorized(run)) {
+      let changed: number | null = null;
+      const row = getWorktree(store, run.id);
+      if (row !== null && deps.edit) {
+        const result = await summarizeWorktree(worktreeDeps(deps.edit), run.id).catch(() => null);
+        if (result?.ok) changed = result.summary.totalFiles;
+      }
+      say(run, writeFailureBody(run.id, reason, changed, row?.path ?? null));
+    }
+    const moved = transitionRun(store, run, from, "failed");
+    note(moved.ok ? `run_failed:${reason}` : `run_fail_refused:${moved.error}`, run.id, moved.ok ? "info" : "warn");
+  }
+
+  const WORKTREE_REASON: Readonly<Record<CreateWorktreeError, FailureReason>> = {
+    not_edit_run: "approval_changed",
+    wrong_state: "approval_changed",
+    no_approval: "approval_changed",
+    approval_mismatch: "approval_changed",
+    cap_reached: "worktree_cap",
+    root_changed: "worktree_failed",
+    path_exists: "worktree_failed",
+    base_missing: "worktree_failed",
+    git_failed: "worktree_failed",
+    verify_failed: "worktree_failed",
+    record_failed: "worktree_failed",
+  };
+
+  async function completeWrite(run: Run, agentMessage: string, edit: RunnerEditDeps): Promise<void> {
+    const row = getWorktree(store, run.id);
+    const result = await summarizeWorktree(worktreeDeps(edit), run.id).catch(() => null);
+    const body = writeCompletionBody({
+      runId: run.id,
+      worktreePath: row?.path ?? "(unknown)",
+      branch: row?.branch ?? "(unknown)",
+      baseSha: row?.baseSha ?? "(unknown)",
+      summary: result?.ok ? result.summary : null,
+      agentMessage,
+    });
+    if (!say(run, body) && getRun(store, run)?.state === "running_write") {
+      say(run, writeFailureBody(run.id, "output_limit", null, row?.path ?? null)); // delivery refused for a reason other than cancellation
+    }
+    const moved = transitionRun(store, run, "running_write", "completed");
+    note(moved.ok ? "run_completed" : `run_complete_refused:${moved.error}`, run.id, moved.ok ? "info" : "warn");
+  }
+
+  async function finishWrite(run: Run, outcome: Outcome, edit: RunnerEditDeps): Promise<void> {
+    switch (outcome.kind) {
+      case "exited":
+        if (outcome.exitCode === 0) return completeWrite(run, outcome.output, edit);
+        return failWrite(run, "running_write", "nonzero_exit");
+      case "timeout":
+        return failWrite(run, "running_write", "timeout");
+      case "output_limit":
+        return failWrite(run, "running_write", "output_limit");
+      case "signalled":
+        return failWrite(run, "running_write", "signalled");
+      case "spawn_failed":
+        return failWrite(run, "running_write", "spawn_failed");
+      case "aborted":
+        return failWrite(run, "running_write", "shutdown");
+      case "cancelled":
+        // The store already moved the run to `cancelled` and queued the one acknowledgement. The worktree is kept.
+        note("run_killed_cancelled", run.id);
+        return;
+    }
+  }
+
+  /**
+   * One approved edit run: re-check authorization, make the worktree (which re-verifies the approval
+   * against the run), move to `running_write`, and start a fresh Codex process in the worktree.
+   * Anything that goes wrong before the process starts fails the run and starts nothing.
+   */
+  async function executeWrite(run: Run): Promise<void> {
+    const edit = deps.edit;
+    if (!edit) return failWrite(run, "queued_write", "edit_not_enabled");
+    if (!authorized(run) || !edit.channelIds.has(run.channelId)) return failWrite(run, "queued_write", "not_authorized");
+    if (run.provider !== "codex") return failWrite(run, "queued_write", "provider_unsupported");
+    if (!repoRootStillValid(deps.repoRoot)) return failWrite(run, "queued_write", "repo_root_changed");
+
+    const created = await createWorktree(worktreeDeps(edit), run);
+    if (!created.ok) {
+      // Cancelled while the worktree was being made: the cancel already answered; there is nothing to report.
+      if (getRun(store, run)?.state !== "queued_write") return note("run_killed_cancelled", run.id);
+      return failWrite(run, "queued_write", WORKTREE_REASON[created.error]);
+    }
+
+    let invocation: Invocation;
+    try {
+      invocation = edit.buildInvocation({ prompt: run.prompt, worktree: created.path });
+    } catch {
+      return failWrite(run, "queued_write", "invocation_invalid");
+    }
+
+    const started = transitionRun(store, run, "queued_write", "running_write");
+    if (!started.ok) {
+      note(`run_start_refused:${started.error}`, run.id);
+      return;
+    }
+    // A cancel recorded between the transition and the launch must win.
+    if (getRun(store, run)?.state !== "running_write") {
+      note("run_killed_cancelled", run.id);
+      return;
+    }
+    note("run_started", run.id);
+
+    const spec: LaunchSpec = {
+      command: deps.codexBin,
+      args: invocation.args,
+      cwd: created.path,
+      env: buildChildEnv(deps.parentEnv),
+      stdin: invocation.stdin,
+    };
+    const outcome = await supervise({
+      launcher: deps.launcher,
+      spec,
+      timeoutMs: edit.timeoutMs,
+      maxOutputBytes,
+      pollMs,
+      shouldCancel: () => getRun(store, run)?.state !== "running_write",
+      signal: abort.signal,
+    });
+    await finishWrite(run, outcome, edit);
+  }
+
   async function pass(): Promise<TickResult> {
     let ran = false;
     // Each run is attempted at most once per pass, so one that stays queued cannot spin the loop.
@@ -196,11 +355,15 @@ export function createRunner(deps: RunnerDeps): Runner {
       sweepApprovals();
       for (;;) {
         if (stopped) return ran ? "ran" : "stopped";
-        const next = listRunsByState(store, "queued", 100).find((run) => !attempted.has(run.id));
+        // One run at a time across both kinds, oldest first.
+        const next = [...listRunsByState(store, "queued", 100), ...listRunsByState(store, "queued_write", 100)]
+          .filter((run) => !attempted.has(run.id))
+          .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))[0];
         if (!next) return ran ? "ran" : "idle";
         attempted.add(next.id);
         try {
-          await execute(next);
+          if (next.state === "queued_write") await executeWrite(next);
+          else await execute(next);
         } catch {
           note("runner_error", next.id, "error");
         }
@@ -224,6 +387,24 @@ export function createRunner(deps: RunnerDeps): Runner {
         if (transitionRun(store, run, "running", "failed").ok) {
           recovered++;
           note("run_failed:restarted", run.id);
+        }
+      }
+      // An edit run that was running is failed the same way, and its worktree is kept for inspection.
+      for (const run of listRunsByState(store, "running_write", 100)) {
+        if (authorized(run)) say(run, writeFailureBody(run.id, "restarted", null, getWorktree(store, run.id)?.path ?? null));
+        if (transitionRun(store, run, "running_write", "failed").ok) {
+          recovered++;
+          note("run_failed:restarted", run.id);
+        }
+      }
+      // Approved edit runs cannot start if edit mode was switched off before this start.
+      if (!deps.edit) {
+        for (const run of listRunsByState(store, "queued_write", 100)) {
+          if (authorized(run)) say(run, writeFailureBody(run.id, "edit_not_enabled", null, null));
+          if (transitionRun(store, run, "queued_write", "failed").ok) {
+            recovered++;
+            note("run_failed:edit_not_enabled", run.id);
+          }
         }
       }
       return recovered;

@@ -1,3 +1,5 @@
+import type { ChangeSummary } from "./git.js";
+
 /**
  * Everything the runner says in Slack is built here. The only variable parts are the run ID
  * (bridge-generated) and the child's stdout, which is untrusted: it is stored verbatim and the
@@ -15,6 +17,10 @@ export const FAILURE_REASONS = [
   "signalled",
   "shutdown",
   "restarted",
+  "edit_not_enabled",
+  "approval_changed",
+  "worktree_cap",
+  "worktree_failed",
 ] as const;
 export type FailureReason = (typeof FAILURE_REASONS)[number];
 
@@ -30,6 +36,10 @@ const REASON_TEXT: Readonly<Record<FailureReason, string>> = {
   signalled: "the provider was stopped unexpectedly.",
   shutdown: "the bridge shut down while it was running.",
   restarted: "the bridge restarted while it was running. It was not run again.",
+  edit_not_enabled: "edit tasks are not enabled here any more, so nothing was run.",
+  approval_changed: "what was approved no longer matches this run, so nothing was run.",
+  worktree_cap: "too many finished worktrees are being kept. Remove old ones, then start a new top-level message.",
+  worktree_failed: "the separate copy of the repository could not be created, so nothing was run.",
 };
 
 /** Failures where whatever the child printed before it stopped is worth showing. */
@@ -115,3 +125,60 @@ export const APPROVE_HINTS = {
   write_slot_busy: (runId: string) => `Run ${runId} could not be approved right now. Try again shortly.`,
   edit_disabled: (runId: string) => `Run ${runId}: edit tasks are not enabled here, so nothing can be approved.`,
 } as const;
+
+// ---- Edit runs: what happened in the worktree. ----
+
+const MAX_LISTED_FILES = 50;
+/** Keeps the whole result inside the outbox part limit even with 50 long file names. */
+export const MAX_AGENT_MESSAGE_CHARS = 8000;
+const STATUS_LETTER = { modified: "M", added: "A", deleted: "D", other: "?" } as const;
+
+function changeLines(summary: ChangeSummary | null): string[] {
+  if (summary === null) return ["I could not read the list of changed files from git."];
+  if (summary.totalFiles === 0) return ["No files changed."];
+  const lines = summary.files.slice(0, MAX_LISTED_FILES).map((f) => {
+    const counts = f.binary ? "binary" : f.added === null ? "new file" : `+${f.added} -${f.removed}`;
+    return `${STATUS_LETTER[f.status]} ${f.path} (${counts})`;
+  });
+  const hidden = summary.totalFiles - Math.min(summary.files.length, MAX_LISTED_FILES);
+  if (hidden > 0) lines.push(`...and ${hidden} more`);
+  lines.push(`${summary.totalFiles} file(s), +${summary.totalAdded} -${summary.totalRemoved}${summary.incomplete ? " (git's output was cut off, so these are lower bounds)" : ""}`);
+  return lines;
+}
+
+export interface WriteResultFields {
+  readonly runId: string;
+  readonly worktreePath: string;
+  readonly branch: string;
+  readonly baseSha: string;
+  /** Computed by the bridge from git. Null if git could not be read. */
+  readonly summary: ChangeSummary | null;
+  /** The agent's final message: untrusted, labeled, and capped. */
+  readonly agentMessage: string;
+}
+
+export function writeCompletionBody(f: WriteResultFields): string {
+  const reported = f.agentMessage.replaceAll("\u0000", "").trim();
+  const capped = reported.length > MAX_AGENT_MESSAGE_CHARS ? `${reported.slice(0, MAX_AGENT_MESSAGE_CHARS)}\n...(cut off)` : reported;
+  return [
+    `Run ${f.runId} finished. Nothing was committed or pushed.`,
+    "",
+    "Changed in the worktree (counted by the bridge from git):",
+    ...changeLines(f.summary),
+    "",
+    `Folder: ${f.worktreePath}`,
+    `Branch: ${f.branch}`,
+    `Started from commit: ${f.baseSha}`,
+    "",
+    "Reported by the agent, not verified:",
+    capped === "" ? "(no message)" : capped,
+  ].join("\n");
+}
+
+/** A failed edit run: a fixed reason and how many files had changed. The worktree is kept for inspection. */
+export function writeFailureBody(runId: string, reason: FailureReason, changedFiles: number | null, worktreePath: string | null): string {
+  const lines = [`Run ${runId} failed: ${REASON_TEXT[reason]}`];
+  if (changedFiles !== null) lines.push(`${changedFiles} file(s) had changed when it stopped.`);
+  if (worktreePath !== null) lines.push(`The worktree was kept for inspection: ${worktreePath}`);
+  return lines.join("\n");
+}

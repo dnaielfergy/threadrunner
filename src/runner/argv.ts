@@ -1,5 +1,5 @@
 import { isAbsolute } from "node:path";
-import { MAX_PROMPT_LENGTH } from "../parser/command.js";
+import { MAX_EDIT_PROMPT_LENGTH, MAX_PROMPT_LENGTH } from "../parser/command.js";
 import type { Invocation } from "./runner.js";
 
 /**
@@ -49,6 +49,41 @@ export function buildCodexInvocation(input: { readonly prompt: string; readonly 
   if (typeof repoRoot !== "string" || !isAbsolute(repoRoot) || repoRoot.includes("\u0000")) throw new RangeError("invalid repository root");
   return {
     args: CODEX_FIXED_ARGS.map((arg) => (arg === "{repoRoot}" ? repoRoot : arg)),
+    stdin: prompt,
+  };
+}
+
+/**
+ * The write run: the same flags as above with the CLI's own `workspace-write` sandbox and the
+ * working root set to the run's disposable worktree (never the owner's checkout). The spike
+ * (docs/design/approvals-and-worktrees.md, section 12) showed this sandbox lets the process write
+ * inside the worktree, blocks writes to the repository's `.git` and so blocks commits, and has no
+ * network. Still absent: every bypass flag, `danger-full-access`, `--add-dir`, `--approve-for-me`,
+ * `--worktree`, config overrides and `--oss`.
+ */
+export const CODEX_WRITE_FIXED_ARGS = [
+  "exec",
+  "--sandbox",
+  "workspace-write",
+  "--cd",
+  "{worktree}",
+  "--ephemeral",
+  "--ignore-user-config",
+  "--ignore-rules",
+  "--color",
+  "never",
+  "-",
+] as const;
+
+/** Pure: the arguments and standard input for one write run inside `worktree`. The prompt is only ever standard input. */
+export function buildCodexWriteInvocation(input: { readonly prompt: string; readonly worktree: string }): Invocation {
+  const { prompt, worktree } = input;
+  if (typeof prompt !== "string" || prompt.trim() === "" || prompt.length > MAX_EDIT_PROMPT_LENGTH || prompt.includes("\u0000")) {
+    throw new RangeError("invalid prompt");
+  }
+  if (typeof worktree !== "string" || !isAbsolute(worktree) || worktree.includes("\u0000")) throw new RangeError("invalid worktree");
+  return {
+    args: CODEX_WRITE_FIXED_ARGS.map((arg) => (arg === "{worktree}" ? worktree : arg)),
     stdin: prompt,
   };
 }

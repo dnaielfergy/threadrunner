@@ -1,4 +1,5 @@
-import { buildCodexInvocation } from "../runner/argv.js";
+import { buildCodexInvocation, buildCodexWriteInvocation } from "../runner/argv.js";
+import { createGit } from "../runner/git.js";
 import { loadRunnerConfig } from "../runner/config.js";
 import { readHeadCommit } from "../runner/head.js";
 import type { Launcher } from "../runner/process.js";
@@ -98,7 +99,19 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
     log: deps.log,
     parentEnv: deps.env,
     onEnqueued: pokeSender,
-    ...(runnerConfig.edit ? { approvalTtlMs: runnerConfig.edit.approvalTtlMs } : {}),
+    ...(runnerConfig.edit
+      ? {
+          approvalTtlMs: runnerConfig.edit.approvalTtlMs,
+          edit: {
+            git: createGit({ launcher: deps.launcher, gitBin: runnerConfig.edit.gitBin, cwd: runnerConfig.edit.worktreeRoot }),
+            worktreeRoot: runnerConfig.edit.worktreeRoot,
+            maxRetained: runnerConfig.edit.maxRetained,
+            timeoutMs: runnerConfig.edit.editTimeoutMs,
+            channelIds: runnerConfig.edit.channelIds,
+            buildInvocation: buildCodexWriteInvocation,
+          },
+        }
+      : {}),
   });
   const pokeRunner = (): void => {
     runner.tick().catch(() => deps.log({ level: "error", code: "runner_tick_failed" }));

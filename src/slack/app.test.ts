@@ -271,10 +271,11 @@ describe("startBridge with the runner", () => {
   describe("edit mode (build_with_approval)", () => {
     const SHA = "0123456789abcdef0123456789abcdef01234567";
     function editSetup() {
+      const gitBin = writeFakeCli(join(tempDir(), "gitbin"));
       const wt = join(realpathSync(tempDir()), "worktrees");
       mkdirSync(wt, { mode: 0o700 });
       chmodSync(wt, 0o700);
-      const ctx = setup({ RUNNER_DEFAULT_MODE: "build_with_approval", EDIT_CHANNEL_IDS: DM, WORKTREE_ROOT: wt, GIT_BIN: writeFakeCli(join(tempDir(), "gitbin")) }, {}, { output: "must not run" });
+      const ctx = setup({ RUNNER_DEFAULT_MODE: "build_with_approval", EDIT_CHANNEL_IDS: DM, WORKTREE_ROOT: wt, GIT_BIN: gitBin }, {}, { output: "must not run" });
       mkdirSync(join(ctx.repoRoot, ".git", "refs", "heads"), { recursive: true });
       writeFileSync(join(ctx.repoRoot, ".git", "HEAD"), "ref: refs/heads/main\n");
       writeFileSync(join(ctx.repoRoot, ".git", "refs", "heads", "main"), `${SHA}\n`);
@@ -294,7 +295,7 @@ describe("startBridge with the runner", () => {
       expect(ctx.connect).not.toHaveBeenCalled();
     });
 
-    it("an edit task asks for approval, /approve queues it, and nothing is ever started", async () => {
+    it("an edit task asks for approval, and /approve starts only git first: the agent never starts if no worktree can be made", async () => {
       const ctx = editSetup();
       const { result, handle } = await bridge(ctx);
       const body = dmMessage("/codex default --edit fix the typo in the README");
@@ -306,13 +307,16 @@ describe("startBridge with the runner", () => {
       const request = String(ctx.api.posts[0]?.text);
       expect(request).toContain("fix the typo in the README");
       expect(request).toContain(SHA);
+      expect(ctx.mock.calls).toHaveLength(0);
 
       const run = getRun(result.store, binding);
       await handle(fakeEnvelope(dmMessage(`/approve ${run?.id}`, { event: { thread_ts: ts } })));
-      expect(getRun(result.store, binding)?.state).toBe("queued_write");
-      await vi.waitFor(() => expect(ctx.api.posts.length).toBe(2));
-      expect(String(ctx.api.posts[1]?.text)).toContain("Approved");
-      expect(ctx.mock.calls).toHaveLength(0);
+      // This fake launcher cannot really create a worktree, so the run must fail before any agent starts.
+      await vi.waitFor(() => expect(getRun(result.store, binding)?.state).toBe("failed"));
+      expect(ctx.mock.calls.length).toBeGreaterThan(0);
+      expect(ctx.mock.calls.every((call) => call.command === ctx.deps.env["GIT_BIN"])).toBe(true);
+      expect(ctx.mock.calls.some((call) => call.args.includes("workspace-write"))).toBe(false);
+      await vi.waitFor(() => expect(ctx.api.posts.map((p) => String(p.text)).join("\n")).toContain("could not be created"));
       await result.stop();
     });
 

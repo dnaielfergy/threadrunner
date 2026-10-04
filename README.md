@@ -106,6 +106,7 @@ Add these to `.env` (see `.env.example`). Startup refuses to proceed, naming the
 | `WORKTREE_ROOT` | Edit mode only. Absolute path to a directory you own, with no group or other access (`chmod 700`), outside the repository, not containing it or the database, at most 200 characters. |
 | `GIT_BIN` | Edit mode only. Absolute path to git (`which git`). Not looked up through `PATH`; refused inside the repository. |
 | `WORKTREE_RETENTION_DAYS`, `WORKTREE_MAX_RETAINED` | Edit mode only. How long a finished run's worktree is kept (1 to 365, default 7) and the most kept at once (1 to 200, default 20). |
+| `RUNNER_EDIT_TIMEOUT_SECONDS` | Edit mode only. Wall-clock limit for one edit run, 60 to 7200. Default 1800. |
 | `APPROVAL_TTL_MINUTES` | Edit mode only. How long an approval request stays valid, 5 to 1440. Default 60. |
 
 Codex signs in with your own ChatGPT login (`codex login`), stored under your home directory. No API key is read or passed.
@@ -129,15 +130,20 @@ codex exec --sandbox read-only --cd <repo> --ephemeral --ignore-user-config --ig
 
 ### What it cannot do
 
-No edits (see below: an approved edit task is queued but nothing runs it yet), commits, pushes, worktrees, other repositories, paths from Slack, Claude runs or `/auto` routing (refused with a fixed reason), more than one run at a time, or a different Slack destination than the run's own thread.
+Edits outside an approved edit task's own worktree, commits, pushes, pull requests, deploys, other repositories, paths from Slack, Claude runs or `/auto` routing (refused with a fixed reason), more than one run at a time, or a different Slack destination than the run's own thread.
 
-### Edit tasks (approval step only, nothing writes yet)
+### Edit tasks
 
 With `RUNNER_DEFAULT_MODE=build_with_approval`, `/codex default --edit <prompt>` asks for approval instead of running. The `--edit` token must come right after the profile, in exactly that spelling. An edit prompt is limited to 2,000 characters so the whole thing fits in one approval message.
 
 1. The bridge reads the repository's current commit straight from `.git` (it runs no git program) and posts an approval request in the thread: the full prompt, the folder and branch an edit would use, the commit it would start from, what will not happen (no commit, push, pull request, deploy), the expiry, and the exact command to reply with.
 2. Only `/approve run-<id>` from you, in that thread, after the request message was actually delivered, before it expires, approves it. A bare "yes" never does. `/cancel` works at any point, and the approval and a cancel cannot both win.
-3. An approved run moves to `queued_write` and **stops there**. No process is started for it and no worktree is created yet. The worktree code exists and is tested (`src/runner/git.ts`, `worktree.ts`) but nothing calls it until the write runner (docs/design/approvals-and-worktrees.md, slice 4). Unapproved requests, and approved runs that are never started, are failed with a notice when their window passes.
+3. An approved run moves to `queued_write`. The runner (still one run at a time, oldest first) then re-checks the approval against the run, makes a **separate git worktree** of the approved commit under `WORKTREE_ROOT` on a branch named `threadrunner/<run-id>`, and starts a fresh `codex exec --sandbox workspace-write --cd <worktree>` there with the same scrubbed environment, output cap and process-group cancellation as read-only runs, and its own time limit. Your own checkout is never the working directory.
+4. When it finishes, the thread gets a summary: the files that changed with added and removed line counts (**counted by the bridge from git**, never file contents), the folder, the branch, the commit it started from, and the agent's own final message labeled **"Reported by the agent, not verified"**. Test results are whatever the agent says; the bridge does not run tests.
+5. **Nothing is committed, pushed, opened as a pull request, or deployed.** In testing (codex-cli 0.160.0) Codex's sandbox blocked writes to the repository's `.git`, so it could not commit; re-check this after Codex upgrades. Review the worktree yourself and merge what you want by hand. A failed, timed-out or cancelled edit run keeps its worktree for inspection. A run left running when the bridge stopped is failed and never re-run.
+6. Unapproved requests, and approved runs that never start, are failed with a notice when their window passes.
+
+Finished worktrees are kept. The cap is enforced (a new edit run is refused while too many are kept), but the scheduled cleanup that applies the retention period is not wired in yet, so remove them with `git worktree remove --force <folder>` and `git branch -D threadrunner/<run-id>`.
 
 Edit tasks are refused, with a reason, when edit mode is off, in a channel not listed in `EDIT_CHANNEL_IDS`, with `/claude` or `/auto`, or when the repository has no readable commit (empty, or `.git` is not a plain directory).
 

@@ -27,6 +27,8 @@ export interface EditConfig {
   readonly retentionDays: number;
   /** Most worktrees kept at once. At the cap, new approvals wait for cleanup. */
   readonly maxRetained: number;
+  /** Wall-clock limit for one edit run. */
+  readonly editTimeoutMs: number;
 }
 
 export const DEFAULT_APPROVAL_TTL_MINUTES = 60;
@@ -37,6 +39,9 @@ export const MAX_WORKTREE_ROOT_LENGTH = 200;
 export const DEFAULT_WORKTREE_RETENTION_DAYS = 7;
 export const MAX_WORKTREE_RETENTION_DAYS = 365;
 export const DEFAULT_WORKTREE_MAX_RETAINED = 20;
+export const DEFAULT_EDIT_TIMEOUT_SECONDS = 1800;
+export const MIN_EDIT_TIMEOUT_SECONDS = 60;
+export const MAX_EDIT_TIMEOUT_SECONDS = 7200;
 export const MAX_WORKTREE_MAX_RETAINED = 200;
 
 export type RunnerConfigResult =
@@ -211,6 +216,17 @@ function loadEditConfig(
   const retentionDays = bounded("WORKTREE_RETENTION_DAYS", DEFAULT_WORKTREE_RETENTION_DAYS, MAX_WORKTREE_RETENTION_DAYS);
   const maxRetained = bounded("WORKTREE_MAX_RETAINED", DEFAULT_WORKTREE_MAX_RETAINED, MAX_WORKTREE_MAX_RETAINED);
 
+  let editTimeoutMs = DEFAULT_EDIT_TIMEOUT_SECONDS * 1000;
+  const editTimeoutRaw = env["RUNNER_EDIT_TIMEOUT_SECONDS"]?.trim() ?? "";
+  if (editTimeoutRaw !== "") {
+    const seconds = /^[0-9]{1,5}$/.test(editTimeoutRaw) ? Number(editTimeoutRaw) : Number.NaN;
+    if (!Number.isInteger(seconds) || seconds < MIN_EDIT_TIMEOUT_SECONDS || seconds > MAX_EDIT_TIMEOUT_SECONDS) {
+      errors.push({ variable: "RUNNER_EDIT_TIMEOUT_SECONDS", code: "malformed" });
+    } else {
+      editTimeoutMs = seconds * 1000;
+    }
+  }
+
   if (errors.length > before || worktreeRoot === null || gitBin === null) return null;
-  return { channelIds, worktreeRoot, approvalTtlMs, gitBin, retentionDays, maxRetained };
+  return { channelIds, worktreeRoot, approvalTtlMs, gitBin, retentionDays, maxRetained, editTimeoutMs };
 }

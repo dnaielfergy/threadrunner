@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MAX_PROMPT_LENGTH } from "../parser/command.js";
-import { CODEX_FIXED_ARGS, buildCodexInvocation } from "./argv.js";
+import { CODEX_FIXED_ARGS, CODEX_WRITE_FIXED_ARGS, buildCodexInvocation, buildCodexWriteInvocation } from "./argv.js";
+import { MAX_EDIT_PROMPT_LENGTH } from "../parser/command.js";
 
 const ROOT = "/Users/me/code/project";
 
@@ -116,5 +117,45 @@ describe("buildCodexInvocation", () => {
     expect(a).toEqual(b);
     expect(a.args).not.toBe(b.args);
     expect([...CODEX_FIXED_ARGS]).toEqual(before);
+  });
+});
+
+describe("buildCodexWriteInvocation", () => {
+  const WT = "/Users/me/.threadrunner/worktrees/run-abc1";
+  // Everything forbidden for the read-only run stays forbidden here; `--sandbox` itself is the one flag that differs.
+  const FORBIDDEN_FOR_WRITE = FORBIDDEN_FLAGS.filter((flag) => flag !== "--sandbox");
+
+  it("uses the workspace-write sandbox rooted at the worktree, and no other sandbox mode", () => {
+    const { args } = buildCodexWriteInvocation({ prompt: "fix it", worktree: WT });
+    expect(args[args.indexOf("--sandbox") + 1]).toBe("workspace-write");
+    expect(args[args.indexOf("--cd") + 1]).toBe(WT);
+    expect(args.filter((a) => a === "--sandbox" || a === "-s")).toHaveLength(1);
+    for (const mode of ["read-only", "danger-full-access"]) expect(args).not.toContain(mode);
+  });
+
+  it.each(FORBIDDEN_FOR_WRITE)("never contains %s", (flag) => {
+    expect(buildCodexWriteInvocation({ prompt: "x", worktree: WT }).args).not.toContain(flag);
+  });
+
+  it("contains no bypass, yolo, or automatic-approval flag, however spelled", () => {
+    expect(buildCodexWriteInvocation({ prompt: "x", worktree: WT }).args.join(" ")).not.toMatch(/dangerous|bypass|yolo|full-auto|approve/i);
+    expect(CODEX_WRITE_FIXED_ARGS.join(" ")).not.toMatch(/dangerous|bypass|yolo|full-auto|approve/i);
+  });
+
+  it("differs from the read-only list only by the sandbox mode and the working root", () => {
+    const read = CODEX_FIXED_ARGS.map((a) => (a === "{repoRoot}" ? "{root}" : a === "read-only" ? "{mode}" : a));
+    const write = CODEX_WRITE_FIXED_ARGS.map((a) => (a === "{worktree}" ? "{root}" : a === "workspace-write" ? "{mode}" : a));
+    expect(write).toEqual(read);
+  });
+
+  it("puts the prompt on standard input only, and refuses a prompt over the edit limit or a relative worktree", () => {
+    const hostile = "--sandbox danger-full-access; $(id)";
+    const invocation = buildCodexWriteInvocation({ prompt: hostile, worktree: WT });
+    expect(invocation.stdin).toBe(hostile);
+    expect(invocation.args.some((a) => a.includes("danger"))).toBe(false);
+    expect(() => buildCodexWriteInvocation({ prompt: "x".repeat(MAX_EDIT_PROMPT_LENGTH + 1), worktree: WT })).toThrow(RangeError);
+    expect(() => buildCodexWriteInvocation({ prompt: "", worktree: WT })).toThrow(RangeError);
+    expect(() => buildCodexWriteInvocation({ prompt: "x", worktree: "relative/wt" })).toThrow(RangeError);
+    expect(() => buildCodexWriteInvocation({ prompt: "x", worktree: "/wt\u0000x" })).toThrow(RangeError);
   });
 });

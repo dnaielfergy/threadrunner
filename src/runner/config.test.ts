@@ -149,6 +149,7 @@ describe("loadRunnerConfig: edit mode", () => {
       gitBin: env.GIT_BIN,
       retentionDays: 7,
       maxRetained: 20,
+      editTimeoutMs: 1_800_000,
     });
   });
 
@@ -204,6 +205,15 @@ describe("loadRunnerConfig: edit mode", () => {
     }
     for (const bad of ["0", "201", "many"]) {
       expect(errors({ ...env, WORKTREE_MAX_RETAINED: bad })).toContainEqual({ variable: "WORKTREE_MAX_RETAINED", code: "malformed" });
+    }
+  });
+
+  it("bounds the edit run time limit to 60..7200 seconds", () => {
+    const { env, load, errors } = editSetup();
+    const ok = load({ ...env, RUNNER_EDIT_TIMEOUT_SECONDS: "3600" });
+    expect(ok.ok && ok.config.edit?.editTimeoutMs).toBe(3_600_000);
+    for (const bad of ["59", "7201", "0", "-1", "1.5", "long"]) {
+      expect(errors({ ...env, RUNNER_EDIT_TIMEOUT_SECONDS: bad })).toContainEqual({ variable: "RUNNER_EDIT_TIMEOUT_SECONDS", code: "malformed" });
     }
   });
 

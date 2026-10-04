@@ -19,7 +19,7 @@ function setup(options: { edit?: Partial<EditIngress> | null; start?: number } =
   let n = 0;
   const store = open(tempDbPath(), { now: () => clock.t++, randomId: () => `aaa${++n}` });
   const { log, entries } = capturingLogger();
-  const config: EditConfig = { channelIds: new Set([DM]), worktreeRoot: "/wt", approvalTtlMs: TTL, gitBin: "/usr/bin/git", retentionDays: 7, maxRetained: 20 };
+  const config: EditConfig = { channelIds: new Set([DM]), worktreeRoot: "/wt", approvalTtlMs: TTL, gitBin: "/usr/bin/git", retentionDays: 7, maxRetained: 20, editTimeoutMs: 1_800_000 };
   const edit: EditIngress | undefined =
     options.edit === null ? undefined : { config, repoRoot: "/repo", readBaseSha: () => SHA, ...options.edit };
   const api = fakeSlackApi();
