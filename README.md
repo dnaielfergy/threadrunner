@@ -62,14 +62,14 @@ npm start   # builds to dist/, then runs dist/slack/main.js with .env loaded
 5. DM the bot, or mention it in the allowlisted control channel:
 
 ```
-/claude default investigate why invite acceptance fails after login
+@ThreadRunner /claude default investigate why invite acceptance fails after login
 @ThreadRunner /codex fast list the failing tests
 ```
 
 Usage: `/claude|/codex|/auto <fast|default|deep> <prompt>`. The model profile is required.
 
 - **Silence means it did not parse.** Anything that is not exactly a command (a missing profile, a typo, plain chat) is ignored with no reply, by design, so a typo looks the same as an outage. Check the format first, then the bridge's stderr (it logs a `parse:<code>` reason, never your text).
-- **The Slack client may intercept a leading `/` in a DM.** If it says the command is not valid, choose the **send as message** option it offers, or mention the bot first (`@ThreadRunner /claude default ...`), which works everywhere.
+- **Start every command with `@ThreadRunner`** (`@ThreadRunner /claude default ...`). Use the allowlisted channel; a DM works only if its `D...` ID is also in `ALLOWED_CHANNEL_IDS`, and the mention form in a DM has not been verified. The Slack client blocks a bare leading `/` before the bridge sees it, and there is no workaround, so do not rely on one.
 
 Then reply **in that thread** with `/status` or `/cancel`. `/approve run-<id>` is recognized but does nothing yet.
 
@@ -212,7 +212,7 @@ Find the IDs in Slack: your member ID under your profile > **Copy member ID**; t
 
 Only `message.im` (a DM) and `app_mention`, from the one allowlisted user, in an allowlisted channel, in the allowlisted workspace. Bot and system messages, message subtypes (edits, deletes, joins), file uploads, shared or Slack Connect channels, external users, and ambient channel messages are dropped with no reply. Dropped events log a reason code and the event ID, never message text.
 
-**Commands are text, not Slack slash commands.** The text `/claude default ...` is parsed by the bridge. Registered Slack slash commands arrive as a different envelope type with no thread and no event ID, which cannot be bound to a run, so they are deliberately unsupported. Because the Slack client also treats a leading `/` as a slash command, Slack may complain that the command is not valid when you type it as the first character of a DM: choose the **send as message** option it offers, or mention the bot first (`@ThreadRunner /claude default ...`), which the bridge strips.
+**Commands are text, not Slack slash commands.** The text `/claude default ...` is parsed by the bridge. Registered Slack slash commands arrive as a different envelope type with no thread and no event ID, which cannot be bound to a run, so they are deliberately unsupported. Because the Slack client also treats a leading `/` as a slash command, it blocks a message that starts with `/` before the bridge sees it. Start every command with `@ThreadRunner` (`@ThreadRunner /claude default ...`) in the allowlisted channel; the bridge strips the mention of an `app_mention` event. A message from a channel that is not in `ALLOWED_CHANNEL_IDS`, a DM included, is dropped and logs `reject:wrong_channel`. Whether a mention typed in a DM works has not been verified, because the bridge strips the mention only for `app_mention` events. Do not rely on any other workaround.
 
 ### 5. Rotating tokens
 
@@ -254,6 +254,8 @@ npm run check       # both
 `src/domain` and `src/parser` are pure logic with no I/O. `src/store` is the only code that touches the database. `src/slack` is the Slack transport: it is the only code with a network dependency (`@slack/socket-mode` and `@slack/web-api`, both imported only by `src/slack/sdk.ts`), and it starts no provider and no subprocess. Tests inject fixtures in place of the SDK and never use the network.
 
 `npm run build` compiles to `dist/` (git-ignored); `npm start` builds and runs the bridge.
+
+For the code layout, how tests avoid real providers, running the bridge against a sandbox repository, and startup troubleshooting, see [docs/development.md](./docs/development.md).
 
 Command grammar: `/codex|/claude|/auto <fast|default|deep> <prompt>`, `/status`, `/cancel`, `/approve run-<id>`. Anything else is rejected.
 
