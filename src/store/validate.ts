@@ -1,4 +1,4 @@
-import { isModelProfile, isProvider, type ModelProfile, type Provider } from "../domain/types.js";
+import { isModelProfile, isProvider, isRunMode, type ModelProfile, type Provider, type RunMode } from "../domain/types.js";
 import { RUN_STATES, type RunState } from "../domain/run-state.js";
 import { MAX_PROMPT_LENGTH, RUN_ID_PATTERN } from "../parser/command.js";
 
@@ -34,6 +34,8 @@ export interface NewRunInput extends Binding {
   readonly provider: Provider;
   readonly profile: ModelProfile;
   readonly prompt: string;
+  /** Defaults to `read`. An `edit` task cannot write until an approval is recorded. */
+  readonly mode?: RunMode;
 }
 
 const matches = (pattern: RegExp, value: unknown): boolean => typeof value === "string" && pattern.test(value);
@@ -57,6 +59,7 @@ export function invalidNewRunField(input: NewRunInput): string | null {
   if (typeof input.prompt !== "string" || input.prompt.length === 0 || input.prompt.length > MAX_PROMPT_LENGTH) return "prompt";
   // SQLite text is not NUL-safe in every code path; refuse rather than risk truncation.
   if (input.prompt.includes("\u0000")) return "prompt";
+  if (input.mode !== undefined && (typeof input.mode !== "string" || !isRunMode(input.mode))) return "mode";
   return null;
 }
 
@@ -64,3 +67,6 @@ export const isRunId = (value: unknown): value is string => matches(RUN_ID_PATTE
 
 export const isRunState = (value: unknown): value is RunState =>
   typeof value === "string" && (RUN_STATES as readonly string[]).includes(value);
+
+/** Git object names: full-length lowercase hex (SHA-1 or SHA-256 repositories). */
+export const isCommitSha = (value: unknown): value is string => typeof value === "string" && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value);

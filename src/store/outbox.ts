@@ -73,7 +73,8 @@ export function splitMessage(body: string, max = MAX_OUTBOX_BODY_LENGTH): string
   return parts.filter((part) => part.trim().length > 0);
 }
 
-function insertMessage(store: Store, runId: string, body: string, now: number): number {
+/** Internal: also used by approval requests and expiry notices, inside their own transaction. */
+export function insertMessage(store: Store, runId: string, body: string, now: number): number {
   const result = store.db
     .prepare("INSERT INTO outbox_messages (run_id, kind, body, created_at, updated_at) VALUES (?, 'message', ?, ?, ?)")
     .run(runId, body, now, now);

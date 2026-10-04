@@ -2,11 +2,14 @@
  * Run lifecycle, mirroring docs/security-architecture.md:
  *
  *   received → validated → queued → running → completed
- *                                 ├→ awaiting_approval → queued_write → running_write → completed
- *                                 ├→ cancelled
- *                                 └→ failed
+ *                  │
+ *                  └→ awaiting_approval → queued_write → running_write → completed
  *
  * `cancelled` and `failed` are reachable from every non-terminal state.
+ *
+ * `validated → awaiting_approval` is for edit-mode tasks only. This pure module knows only states;
+ * the mode rules are enforced by the store and by database triggers. `running → awaiting_approval`
+ * is kept for a possible future plan mode.
  */
 export const RUN_STATES = [
   "received",
@@ -26,7 +29,7 @@ export const TERMINAL_STATES: readonly RunState[] = ["completed", "cancelled", "
 
 const FORWARD: Readonly<Record<RunState, readonly RunState[]>> = {
   received: ["validated"],
-  validated: ["queued"],
+  validated: ["queued", "awaiting_approval"],
   queued: ["running"],
   running: ["completed", "awaiting_approval"],
   awaiting_approval: ["queued_write"],

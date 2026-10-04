@@ -4,6 +4,7 @@ import { RUN_STATES, canTransition, isTerminal, legalTransitions, transition, ty
 const LEGAL: [RunState, RunState][] = [
   ["received", "validated"],
   ["validated", "queued"],
+  ["validated", "awaiting_approval"],
   ["queued", "running"],
   ["running", "completed"],
   ["running", "awaiting_approval"],

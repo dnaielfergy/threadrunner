@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { RUN_STATES, type RunState } from "../domain/run-state.js";
 import { RUN_ID_PATTERN } from "../parser/command.js";
 import { createRunFromEvent, getApproval, getRun, listRunEvents, listRunsByState, recordApproval, transitionRun, type Binding } from "./index.js";
-import { BINDING, SECRET_PROMPT, fakeClock, fakeIds, newRun, open, tempDbPath } from "./test-utils.js";
+import { BINDING, SECRET_PROMPT, editRunQueuedWrite, fakeClock, fakeIds, newRun, open, tempDbPath } from "./test-utils.js";
 
 const count = (store: ReturnType<typeof open>, table: string): number =>
   Number(store.db.prepare(`SELECT count(*) AS n FROM ${table}`).get()?.["n"]);
@@ -331,27 +331,33 @@ describe("state transitions", () => {
   });
 
   it("rejects every illegal transition and leaves the run unchanged", () => {
+    const route: Record<RunState, RunState[]> = {
+      received: [],
+      validated: ["validated"],
+      queued: ["validated", "queued"],
+      running: ["validated", "queued", "running"],
+      awaiting_approval: ["validated", "queued", "running", "awaiting_approval"],
+      queued_write: [],
+      running_write: [],
+      completed: ["validated", "queued", "running", "completed"],
+      cancelled: ["cancelled"],
+      failed: ["failed"],
+    };
     for (const from of RUN_STATES) {
       for (const to of RUN_STATES) {
         // Build a fresh run for each pair and drive it to `from` via legal moves only.
         const s = store();
-        createRunFromEvent(s, newRun());
-        const route: Record<RunState, RunState[]> = {
-          received: [],
-          validated: ["validated"],
-          queued: ["validated", "queued"],
-          running: ["validated", "queued", "running"],
-          awaiting_approval: ["validated", "queued", "running", "awaiting_approval"],
-          queued_write: ["validated", "queued", "running", "awaiting_approval", "queued_write"],
-          running_write: ["validated", "queued", "running", "awaiting_approval", "queued_write", "running_write"],
-          completed: ["validated", "queued", "running", "completed"],
-          cancelled: ["cancelled"],
-          failed: ["failed"],
-        };
-        let cur: RunState = "received";
-        for (const step of route[from]) {
-          expect(transitionRun(s, BINDING, cur, step).ok).toBe(true);
-          cur = step;
+        if (from === "queued_write" || from === "running_write") {
+          // Write states are reachable only through the approval path, never through transitionRun alone.
+          editRunQueuedWrite(s);
+          if (from === "running_write") expect(transitionRun(s, BINDING, "queued_write", "running_write").ok).toBe(true);
+        } else {
+          createRunFromEvent(s, newRun());
+          let cur: RunState = "received";
+          for (const step of route[from]) {
+            expect(transitionRun(s, BINDING, cur, step).ok).toBe(true);
+            cur = step;
+          }
         }
         const before = getRun(s, BINDING);
         const events = count(s, "run_events");

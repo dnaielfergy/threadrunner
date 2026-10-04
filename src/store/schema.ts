@@ -1,4 +1,4 @@
-import { PROVIDERS, MODEL_PROFILES } from "../domain/types.js";
+import { PROVIDERS, MODEL_PROFILES, RUN_MODES } from "../domain/types.js";
 import { RUN_STATES, TERMINAL_STATES } from "../domain/run-state.js";
 import { MAX_OUTBOX_BODY_LENGTH } from "./validate.js";
 
@@ -122,6 +122,89 @@ export const MIGRATIONS: readonly string[] = [
   BEFORE INSERT ON outbox_messages
   WHEN NEW.kind = 'cancel_ack' AND (SELECT state FROM runs WHERE id = NEW.run_id) IS NOT 'cancelled'
   BEGIN SELECT RAISE(ABORT, 'cancel acknowledgement requires a cancelled run'); END;
+  `,
+  // Version 2: approvals and worktrees (docs/design/approvals-and-worktrees.md, section 8).
+  `
+  ALTER TABLE runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'read' CHECK (mode IN (${list(RUN_MODES)}));
+
+  DROP TRIGGER runs_immutable_columns;
+  CREATE TRIGGER runs_immutable_columns
+  BEFORE UPDATE OF id, team_id, user_id, channel_id, root_thread_ts, provider, profile, prompt, mode, created_at ON runs
+  BEGIN SELECT RAISE(ABORT, 'run binding and task columns are immutable'); END;
+
+  -- What the approval request showed. Linked by message ID so the outbox table does not change.
+  CREATE TABLE edit_requests (
+    run_id             TEXT PRIMARY KEY REFERENCES runs (id),
+    base_sha           TEXT NOT NULL CHECK (length(base_sha) IN (40, 64) AND base_sha NOT GLOB '*[^0-9a-f]*'),
+    requested_at       INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL CHECK (expires_at > requested_at),
+    request_message_id INTEGER NOT NULL UNIQUE REFERENCES outbox_messages (id)
+  ) STRICT;
+
+  CREATE TRIGGER edit_requests_edit_runs_only
+  BEFORE INSERT ON edit_requests
+  WHEN (SELECT mode FROM runs WHERE id = NEW.run_id) IS NOT 'edit'
+    OR (SELECT state FROM runs WHERE id = NEW.run_id) IS NOT 'awaiting_approval'
+  BEGIN SELECT RAISE(ABORT, 'an edit request needs an edit-mode run awaiting approval'); END;
+  CREATE TRIGGER edit_requests_no_update BEFORE UPDATE ON edit_requests
+  BEGIN SELECT RAISE(ABORT, 'edit_requests is append-only'); END;
+  CREATE TRIGGER edit_requests_no_delete BEFORE DELETE ON edit_requests
+  BEGIN SELECT RAISE(ABORT, 'edit_requests is append-only'); END;
+
+  -- NULL only for a row written before this version.
+  ALTER TABLE approvals ADD COLUMN invocation_sha256 TEXT
+    CHECK (invocation_sha256 IS NULL OR (length(invocation_sha256) = 64 AND invocation_sha256 NOT GLOB '*[^0-9a-f]*'));
+
+  -- Filled in by the worktree lifecycle work. removed_at is the only column that ever changes, and only once.
+  CREATE TABLE worktrees (
+    run_id     TEXT PRIMARY KEY REFERENCES runs (id),
+    path       TEXT NOT NULL,
+    branch     TEXT NOT NULL,
+    base_sha   TEXT NOT NULL CHECK (length(base_sha) IN (40, 64) AND base_sha NOT GLOB '*[^0-9a-f]*'),
+    created_at INTEGER NOT NULL,
+    removed_at INTEGER
+  ) STRICT;
+
+  CREATE TRIGGER worktrees_need_approval
+  BEFORE INSERT ON worktrees
+  WHEN NOT EXISTS (SELECT 1 FROM approvals WHERE run_id = NEW.run_id AND invocation_sha256 IS NOT NULL)
+  BEGIN SELECT RAISE(ABORT, 'a worktree requires a recorded approval'); END;
+  CREATE TRIGGER worktrees_immutable_columns
+  BEFORE UPDATE OF run_id, path, branch, base_sha, created_at ON worktrees
+  BEGIN SELECT RAISE(ABORT, 'worktree columns are immutable'); END;
+  CREATE TRIGGER worktrees_removed_once
+  BEFORE UPDATE OF removed_at ON worktrees
+  WHEN OLD.removed_at IS NOT NULL
+  BEGIN SELECT RAISE(ABORT, 'worktree removal is recorded once'); END;
+  CREATE TRIGGER worktrees_no_delete BEFORE DELETE ON worktrees
+  BEGIN SELECT RAISE(ABORT, 'worktrees cannot be deleted'); END;
+
+  -- Defense in depth, as invariant 8 already is: these hold even if the store code has a bug.
+  CREATE TRIGGER runs_write_requires_approval
+  BEFORE UPDATE OF state ON runs
+  WHEN NEW.state = 'queued_write'
+   AND NOT (NEW.mode = 'edit' AND OLD.state = 'awaiting_approval'
+            AND EXISTS (SELECT 1 FROM approvals WHERE run_id = NEW.id AND invocation_sha256 IS NOT NULL))
+  BEGIN SELECT RAISE(ABORT, 'queued_write requires an edit run and a recorded approval'); END;
+
+  CREATE TRIGGER runs_running_write_after_queued
+  BEFORE UPDATE OF state ON runs
+  WHEN NEW.state = 'running_write' AND OLD.state IS NOT 'queued_write'
+  BEGIN SELECT RAISE(ABORT, 'running_write only follows queued_write'); END;
+
+  CREATE TRIGGER runs_approval_from_validated_edit_only
+  BEFORE UPDATE OF state ON runs
+  WHEN NEW.state = 'awaiting_approval' AND OLD.state = 'validated' AND NEW.mode <> 'edit'
+  BEGIN SELECT RAISE(ABORT, 'only edit-mode runs can await approval from validated'); END;
+
+  CREATE TRIGGER runs_edit_never_read_only
+  BEFORE UPDATE OF state ON runs
+  WHEN NEW.mode = 'edit' AND NEW.state IN ('queued', 'running')
+  BEGIN SELECT RAISE(ABORT, 'edit-mode runs never take the read-only path'); END;
+
+  -- Invariant 7: at most one write run operates at a time (one configured repository).
+  -- queued_write is deliberately not covered: an approved second run waits there.
+  CREATE UNIQUE INDEX runs_one_running_write ON runs (state) WHERE state = 'running_write';
   `,
 ];
 

@@ -1,10 +1,12 @@
 import { transition, type RunState } from "../domain/run-state.js";
-import type { ModelProfile, Provider } from "../domain/types.js";
+import type { ModelProfile, Provider, RunMode } from "../domain/types.js";
 import { RUN_ID_PATTERN } from "../parser/command.js";
 import { inTransaction, int, text, timestamp, type Row, type Store } from "./database.js";
 import { StoreError } from "./errors.js";
-import { CANCEL_ACK_BODY, failPendingMessages, insertCancelAck } from "./outbox.js";
-import { invalidBindingField, invalidNewRunField, isRunId, isRunState, type Binding, type NewRunInput } from "./validate.js";
+import { invocationSha256 } from "./invocation.js";
+import { MAX_OUTBOX_BODY_LENGTH } from "./validate.js";
+import { CANCEL_ACK_BODY, failPendingMessages, insertCancelAck, insertMessage } from "./outbox.js";
+import { invalidBindingField, invalidNewRunField, isCommitSha, isRunId, isRunState, type Binding, type NewRunInput } from "./validate.js";
 
 export interface Run extends Binding {
   readonly id: string;
@@ -12,6 +14,8 @@ export interface Run extends Binding {
   readonly profile: ModelProfile;
   /** Stored once, for the runner. Never copied into run events, outbox messages, or logs. */
   readonly prompt: string;
+  /** What the task asked for. Immutable. */
+  readonly mode: RunMode;
   readonly state: RunState;
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -32,6 +36,17 @@ export interface Approval {
   /** Run state at the moment the approval was recorded. */
   readonly runState: RunState;
   readonly approvedAt: number;
+  /** Hash of exactly what was approved. Null only for a row written before schema version 2. */
+  readonly invocationSha256: string | null;
+}
+
+/** What the approval request showed, recorded when the run entered `awaiting_approval`. */
+export interface EditRequest {
+  readonly runId: string;
+  readonly baseSha: string;
+  readonly requestedAt: number;
+  readonly expiresAt: number;
+  readonly requestMessageId: number;
 }
 
 export type CreateRunResult =
@@ -47,11 +62,30 @@ export type CreateRunResult =
  * so a caller learns nothing about runs it does not own.
  */
 export type RunError = "invalid_input" | "not_found";
-export type TransitionError = RunError | "stale_state" | "illegal_transition";
+export type TransitionError = RunError | "stale_state" | "illegal_transition" | "write_slot_busy";
 export type TransitionOutcome = { readonly ok: true; readonly run: Run } | { readonly ok: false; readonly error: TransitionError };
 export type ApprovalOutcome =
   | { readonly ok: true; readonly approval: Approval }
   | { readonly ok: false; readonly error: RunError | "not_awaiting_approval" | "already_approved" };
+
+export type RequestApprovalOutcome =
+  | { readonly ok: true; readonly run: Run; readonly request: EditRequest }
+  | { readonly ok: false; readonly error: RunError | "not_validated" | "not_edit_mode" | "invalid_body" | "stale_state" };
+
+export type ApproveRunOutcome =
+  | { readonly ok: true; readonly run: Run; readonly approval: Approval }
+  | {
+      readonly ok: false;
+      readonly error:
+        | RunError
+        | "not_awaiting_approval"
+        | "not_edit_mode"
+        | "no_request"
+        | "already_approved"
+        | "not_delivered"
+        | "expired"
+        | "write_slot_busy";
+    };
 
 const MAX_RUN_ID_ATTEMPTS = 5;
 
@@ -70,6 +104,7 @@ function rowToRun(row: Row): Run {
     provider: text(row, "provider") as Provider, // constrained by a CHECK in the schema
     profile: text(row, "profile") as ModelProfile, // constrained by a CHECK in the schema
     prompt: text(row, "prompt"),
+    mode: text(row, "mode") as RunMode, // constrained by a CHECK in the schema
     state: stateOf(text(row, "state")),
     createdAt: int(row, "created_at"),
     updatedAt: int(row, "updated_at"),
@@ -155,12 +190,13 @@ export function createRunFromEvent(store: Store, input: NewRunInput): CreateRunR
     const id = allocateRunId(store);
     const now = timestamp(store);
     const state: RunState = "received";
+    const mode: RunMode = input.mode ?? "read";
     store.db
       .prepare(
-        `INSERT INTO runs (id, team_id, user_id, channel_id, root_thread_ts, provider, profile, prompt, state, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, team_id, user_id, channel_id, root_thread_ts, provider, profile, prompt, mode, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(id, input.teamId, input.userId, input.channelId, input.rootThreadTs, input.provider, input.profile, input.prompt, state, now, now);
+      .run(id, input.teamId, input.userId, input.channelId, input.rootThreadTs, input.provider, input.profile, input.prompt, mode, state, now, now);
     store.db
       .prepare("INSERT INTO inbound_events (team_id, event_id, channel_id, message_ts, run_id, outcome, received_at) VALUES (?, ?, ?, ?, ?, 'created', ?)")
       .run(input.teamId, input.eventId, input.channelId, input.messageTs, id, now);
@@ -177,6 +213,7 @@ export function createRunFromEvent(store: Store, input: NewRunInput): CreateRunR
         provider: input.provider,
         profile: input.profile,
         prompt: input.prompt,
+        mode,
         state,
         createdAt: now,
         updatedAt: now,
@@ -186,10 +223,43 @@ export function createRunFromEvent(store: Store, input: NewRunInput): CreateRunR
 }
 
 /**
- * The only way to change a run's state. The caller presents the full binding and the state it
- * believes the run is in; the update applies only if the run is still in that state
- * (compare-and-swap) and `transition()` allows the move. Cancelling also queues the single
- * cancellation acknowledgement and fails any other pending outbound messages, atomically.
+ * Mode rules, on top of the pure state graph. `queued_write` is reachable only through `approveRun`,
+ * which records the approval in the same transaction. The database triggers repeat these rules.
+ */
+function modeForbids(run: Run, to: RunState, viaApproval: boolean): boolean {
+  if (to === "queued_write") return !viaApproval;
+  if (run.mode === "edit") return to === "queued" || to === "running";
+  return to === "running_write" || (run.state === "validated" && to === "awaiting_approval");
+}
+
+/** Must run inside a transaction. Moves the run with a compare-and-swap and writes the audit event. */
+function applyTransition(store: Store, run: Run, to: RunState, now: number, viaApproval = false): TransitionOutcome {
+  if (!transition(run.state, to).ok || modeForbids(run, to, viaApproval)) return { ok: false, error: "illegal_transition" };
+
+  try {
+    const result = store.db.prepare("UPDATE runs SET state = ?, updated_at = ? WHERE id = ? AND state = ?").run(to, now, run.id, run.state);
+    if (result.changes !== 1) return { ok: false, error: "stale_state" };
+  } catch (error) {
+    // The partial unique index on running_write: another write run is operating.
+    if (to === "running_write" && error instanceof Error && /UNIQUE constraint failed/.test(error.message)) {
+      return { ok: false, error: "write_slot_busy" };
+    }
+    throw error;
+  }
+  insertEvent(store, run.id, "transition", run.state, to, now);
+  if (to === "cancelled") {
+    failPendingMessages(store, run.id, "run cancelled", now);
+    insertCancelAck(store, run.id, CANCEL_ACK_BODY, now);
+  }
+  return { ok: true, run: { ...run, state: to, updatedAt: now } };
+}
+
+/**
+ * The only way to change a run's state (with `approveRun` and `expireStaleApprovals`, which
+ * share its internals). The caller presents the full binding and the state it believes the run is
+ * in; the update applies only if the run is still in that state (compare-and-swap) and
+ * `transition()` allows the move. Cancelling also queues the single cancellation acknowledgement
+ * and fails any other pending outbound messages, atomically.
  */
 export function transitionRun(store: Store, binding: Binding, expected: RunState, to: RunState): TransitionOutcome {
   if (invalidBindingField(binding) || !isRunState(expected) || !isRunState(to)) return { ok: false, error: "invalid_input" };
@@ -198,17 +268,164 @@ export function transitionRun(store: Store, binding: Binding, expected: RunState
     const run = findByBinding(store, binding);
     if (!run) return { ok: false, error: "not_found" };
     if (run.state !== expected) return { ok: false, error: "stale_state" };
-    if (!transition(expected, to).ok) return { ok: false, error: "illegal_transition" };
+    return applyTransition(store, run, to, timestamp(store));
+  });
+}
+
+const MIN_APPROVAL_TTL_MS = 60_000;
+const MAX_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Move an edit-mode run from `validated` to `awaiting_approval` and queue the approval request
+ * message, atomically: either the thread has a request and the run is waiting on it, or neither.
+ * `body` is the fixed-template request text built by the caller (it must show what will be approved).
+ * Nothing here runs anything or unlocks anything.
+ */
+export function requestApproval(
+  store: Store,
+  binding: Binding,
+  runId: string,
+  request: { readonly baseSha: string; readonly body: string; readonly ttlMs: number },
+): RequestApprovalOutcome {
+  if (invalidBindingField(binding) || !isRunId(runId) || !isCommitSha(request.baseSha)) return { ok: false, error: "invalid_input" };
+  if (!Number.isSafeInteger(request.ttlMs) || request.ttlMs < MIN_APPROVAL_TTL_MS || request.ttlMs > MAX_APPROVAL_TTL_MS) {
+    return { ok: false, error: "invalid_input" };
+  }
+  if (typeof request.body !== "string" || request.body.length === 0 || request.body.length > MAX_OUTBOX_BODY_LENGTH || request.body.includes("\u0000")) {
+    return { ok: false, error: "invalid_body" };
+  }
+
+  return inTransaction(store, (): RequestApprovalOutcome => {
+    const run = findByBinding(store, binding);
+    if (!run || run.id !== runId) return { ok: false, error: "not_found" };
+    if (run.mode !== "edit") return { ok: false, error: "not_edit_mode" };
+    if (run.state !== "validated") return { ok: false, error: "not_validated" };
 
     const now = timestamp(store);
-    const result = store.db.prepare("UPDATE runs SET state = ?, updated_at = ? WHERE id = ? AND state = ?").run(to, now, run.id, expected);
-    if (result.changes !== 1) return { ok: false, error: "stale_state" };
-    insertEvent(store, run.id, "transition", expected, to, now);
-    if (to === "cancelled") {
-      failPendingMessages(store, run.id, "run cancelled", now);
-      insertCancelAck(store, run.id, CANCEL_ACK_BODY, now);
+    const moved = applyTransition(store, run, "awaiting_approval", now);
+    if (!moved.ok) return { ok: false, error: moved.error === "stale_state" ? "stale_state" : "not_validated" };
+
+    const messageId = insertMessage(store, run.id, request.body, now);
+    const expiresAt = now + request.ttlMs;
+    store.db
+      .prepare("INSERT INTO edit_requests (run_id, base_sha, requested_at, expires_at, request_message_id) VALUES (?, ?, ?, ?, ?)")
+      .run(run.id, request.baseSha, now, expiresAt, messageId);
+    return { ok: true, run: moved.run, request: { runId: run.id, baseSha: request.baseSha, requestedAt: now, expiresAt, requestMessageId: messageId } };
+  });
+}
+
+/**
+ * Approve exactly what the request showed. In one transaction it checks every precondition that
+ * lives in the store (binding, run ID, state, mode, request exists, no earlier approval, request
+ * was delivered to Slack, not expired), inserts the approval with its invocation hash, and moves
+ * `awaiting_approval -> queued_write`. All of it commits or none of it does, and `/cancel` racing
+ * this call is a compare-and-swap on the same row, so exactly one wins.
+ *
+ * Whether edit mode is enabled (configuration, per-channel) is the caller's check, made first.
+ */
+export function approveRun(store: Store, binding: Binding, runId: string, options: { readonly repoRoot: string }): ApproveRunOutcome {
+  if (invalidBindingField(binding) || !isRunId(runId) || typeof options.repoRoot !== "string" || options.repoRoot.length === 0) {
+    return { ok: false, error: "invalid_input" };
+  }
+
+  return inTransaction(store, (): ApproveRunOutcome => {
+    const run = findByBinding(store, binding);
+    if (!run || run.id !== runId) return { ok: false, error: "not_found" };
+    if (run.state !== "awaiting_approval") return { ok: false, error: "not_awaiting_approval" };
+    if (run.mode !== "edit") return { ok: false, error: "not_edit_mode" };
+    const request = readEditRequest(store, run.id);
+    if (!request) return { ok: false, error: "no_request" };
+    if (store.db.prepare("SELECT 1 AS x FROM approvals WHERE run_id = ?").get(run.id)) return { ok: false, error: "already_approved" };
+    // An outbox message can fail after its retries; approving something the user never saw must be impossible.
+    const message = store.db.prepare("SELECT status FROM outbox_messages WHERE id = ?").get(request.requestMessageId);
+    if (message?.["status"] !== "sent") return { ok: false, error: "not_delivered" };
+    const now = timestamp(store);
+    if (now >= request.expiresAt) return { ok: false, error: "expired" };
+
+    const hash = invocationSha256({
+      runId: run.id,
+      provider: run.provider,
+      profile: run.profile,
+      mode: run.mode,
+      prompt: run.prompt,
+      baseSha: request.baseSha,
+      repoRoot: options.repoRoot,
+    });
+    store.db
+      .prepare("INSERT INTO approvals (run_id, approved_by_user_id, run_state, approved_at, invocation_sha256) VALUES (?, ?, ?, ?, ?)")
+      .run(run.id, binding.userId, run.state, now, hash);
+    insertEvent(store, run.id, "approval_recorded", run.state, run.state, now);
+    const moved = applyTransition(store, run, "queued_write", now, true);
+    if (!moved.ok) throw new StoreError("corrupt_row", "an awaiting_approval edit run could not move to queued_write");
+    return {
+      ok: true,
+      run: moved.run,
+      approval: { runId: run.id, approvedByUserId: binding.userId, runState: run.state, approvedAt: now, invocationSha256: hash },
+    };
+  });
+}
+
+function readEditRequest(store: Store, runId: string): EditRequest | null {
+  const row = store.db.prepare("SELECT * FROM edit_requests WHERE run_id = ?").get(runId);
+  if (!row) return null;
+  return {
+    runId: text(row, "run_id"),
+    baseSha: text(row, "base_sha"),
+    requestedAt: int(row, "requested_at"),
+    expiresAt: int(row, "expires_at"),
+    requestMessageId: int(row, "request_message_id"),
+  };
+}
+
+/** The recorded approval request for a run. Null for malformed input, any binding mismatch, or no request. */
+export function getEditRequest(store: Store, binding: Binding): EditRequest | null {
+  const run = getRun(store, binding);
+  return run ? readEditRequest(store, run.id) : null;
+}
+
+export interface ExpireOptions {
+  /** How long an approved run may wait in `queued_write`, measured from the approval. */
+  readonly queuedWriteTtlMs: number;
+  /** Fixed notices posted to the thread. Never include prompt text or free-form detail. */
+  readonly notices: { readonly awaitingApproval: string; readonly queuedWrite: string };
+}
+
+/**
+ * Fail runs whose approval window has passed: `awaiting_approval` past the request's expiry, and
+ * `queued_write` older than `queuedWriteTtlMs` since the approval. An expired run cannot be revived.
+ * Each failure also fails the run's still-pending messages (an undelivered request must not appear
+ * after the run is dead) and queues one fixed notice, atomically. Safe to call repeatedly; at most
+ * 100 runs per call. Returns the runs that were failed.
+ */
+export function expireStaleApprovals(store: Store, options: ExpireOptions): Run[] {
+  const { queuedWriteTtlMs, notices } = options;
+  if (!Number.isSafeInteger(queuedWriteTtlMs) || queuedWriteTtlMs < 1) throw new RangeError("queuedWriteTtlMs must be a positive integer");
+  for (const notice of [notices.awaitingApproval, notices.queuedWrite]) {
+    if (notice.length === 0 || notice.length > MAX_OUTBOX_BODY_LENGTH) throw new RangeError("expiry notices must be 1 to 3000 characters");
+  }
+
+  return inTransaction(store, (): Run[] => {
+    const now = timestamp(store);
+    const due = store.db
+      .prepare(
+        `SELECT r.*, 'a' AS why FROM runs r JOIN edit_requests e ON e.run_id = r.id
+           WHERE r.state = 'awaiting_approval' AND e.expires_at <= ?1
+         UNION ALL
+         SELECT r.*, 'q' AS why FROM runs r JOIN approvals a ON a.run_id = r.id
+           WHERE r.state = 'queued_write' AND a.approved_at + ?2 <= ?1
+         ORDER BY created_at, id LIMIT 100`,
+      )
+      .all(now, queuedWriteTtlMs);
+    const failed: Run[] = [];
+    for (const row of due) {
+      const run = rowToRun(row);
+      const moved = applyTransition(store, run, "failed", now);
+      if (!moved.ok) continue;
+      failPendingMessages(store, run.id, "approval expired", now);
+      insertMessage(store, run.id, row["why"] === "a" ? notices.awaitingApproval : notices.queuedWrite, now);
+      failed.push(moved.run);
     }
-    return { ok: true, run: { ...run, state: to, updatedAt: now } };
+    return failed;
   });
 }
 
@@ -231,7 +448,7 @@ export function recordApproval(store: Store, binding: Binding, runId: string): A
       .prepare("INSERT INTO approvals (run_id, approved_by_user_id, run_state, approved_at) VALUES (?, ?, ?, ?)")
       .run(run.id, binding.userId, run.state, now);
     insertEvent(store, run.id, "approval_recorded", run.state, run.state, now);
-    return { ok: true, approval: { runId: run.id, approvedByUserId: binding.userId, runState: run.state, approvedAt: now } };
+    return { ok: true, approval: { runId: run.id, approvedByUserId: binding.userId, runState: run.state, approvedAt: now, invocationSha256: null } };
   });
 }
 
@@ -245,6 +462,7 @@ export function getApproval(store: Store, binding: Binding): Approval | null {
     approvedByUserId: text(row, "approved_by_user_id"),
     runState: stateOf(text(row, "run_state")),
     approvedAt: int(row, "approved_at"),
+    invocationSha256: row["invocation_sha256"] === null ? null : text(row, "invocation_sha256"),
   };
 }
 

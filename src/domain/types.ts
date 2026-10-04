@@ -16,3 +16,11 @@ export function isProvider(value: string): value is Provider {
 export function isModelProfile(value: string): value is ModelProfile {
   return (MODEL_PROFILES as readonly string[]).includes(value);
 }
+
+/** What a task asked for. `edit` tasks need a recorded approval before anything can write. */
+export const RUN_MODES = ["read", "edit"] as const;
+export type RunMode = (typeof RUN_MODES)[number];
+
+export function isRunMode(value: string): value is RunMode {
+  return (RUN_MODES as readonly string[]).includes(value);
+}
