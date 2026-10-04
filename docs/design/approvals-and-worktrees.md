@@ -16,9 +16,9 @@ ThreadRunner's main purpose is to start CLI agents that already exist on the own
 - More than one repository (needs named aliases, a schema change, and per-repo locks; separate design).
 - A Claude write runner (#7). The design is provider-neutral, the first implementation is Codex only.
 - Showing diff hunks in Slack. The summary lists file names and counts only.
-- Selecting a named agent. See open question 2.
+- Selecting a named agent. Input recorded in section 14; not yet designed.
 
-## 2. Decisions already made by the owner
+## 2. Decisions made by the owner
 
 | # | Question | Decision |
 |---|---|---|
@@ -26,6 +26,9 @@ ThreadRunner's main purpose is to start CLI agents that already exist on the own
 | 2 | How does a task ask for edit mode? | **`--edit` token** right after the profile: `/codex default --edit <prompt>`. |
 | 3 | Where do test results come from? | **Agent-reported and labeled.** The bridge computes changed files and diff counts itself. |
 | 4 | Where do worktrees live? | **A separate `WORKTREE_ROOT`** outside the repository. Needs an amendment to invariant 6. |
+| 5 | Cleanup | **Automatic retention plus manual removal.** No `/discard` command. |
+| 6 | Dirty checkout | **Proceed**, and the approval request says uncommitted changes are not included. |
+| 7 | What is an agent? | **Standard agent structures: Markdown files in an agent folder, each with a goal, skills, and tools.** See section 14. |
 
 ## 3. Flow and state machine
 
@@ -142,7 +145,7 @@ Invariant 7 is enforced in the database, not only in code: a partial unique inde
 - **The sweep removes an entry only if all of these hold:** its real path is a direct child of `WORKTREE_ROOT`; the name matches `RUN_ID_PATTERN`; it is not a symlink; the run exists in the database, is terminal, and is older than the retention; git reports it as a registered worktree of the configured repository. Removal uses `git worktree remove` (forced only here, after retention), then `branch -D` for the matching branch. The sweep never runs `rm -rf` on an unvalidated path and leaves unknown entries alone, logging a fixed code.
 - **Cap:** at most `WORKTREE_MAX_RETAINED` (default 20). At the cap, new approvals are refused with a fixed notice until the sweep frees space.
 - **Crash recovery:** a run in `running_write` at startup is failed and its worktree kept; it is never resumed or re-run. `queued_write` past its TTL is failed; otherwise it proceeds normally.
-- A `/discard` command is not part of this change (open question 3).
+- There is no `/discard` command (decision 5): automatic retention plus manual `git worktree remove`.
 
 ## 7. Configuration
 
@@ -216,6 +219,28 @@ Everything below uses a throwaway repository and a throwaway worktree root. None
 4. Does the installed Git support reading attributes from a given tree?
 5. Repeat 1 against a standalone clone, to decide between 6.4 and 6.5.
 
+### Running the spike and results so far
+
+`docs/design/spikes/approvals-worktrees-spike.sh` runs everything below in a throwaway directory in `$HOME` (never under `/tmp`, `/var`, or `$TMPDIR`, where the sandbox may allow writes and the result would mean nothing). `PART=A` is git only and uses no Codex; `PART=B` uses real Codex. It reports evidence from the filesystem, not what the agent says it did.
+
+**Part A, run on Linux with Git 2.43.0.** Each case is a planted command that proves it ran by creating a file. The macOS result is still needed, because Git versions differ.
+
+| Case | Plain git | With hardening |
+|---|---|---|
+| `post-checkout` hook, run by `git worktree add` | **runs** | stopped by `-c core.hooksPath=/dev/null` |
+| `core.fsmonitor` in repository config, run by `git status` | **runs** | stopped by `-c core.fsmonitor=false` |
+| `.git` pointer file in the worktree overwritten to point at a hostile git directory | **runs the hostile directory's `core.fsmonitor`** | stopped by explicit `--git-dir` and `--work-tree` plus `-c core.fsmonitor=false` |
+| Filter driver named by an in-worktree `.gitattributes`, defined in the repository's own config (as a git-lfs setup is) | **runs, via `git diff --numstat`** | stopped by `--attr-source=HEAD` |
+| `textconv` driver named by an in-worktree `.gitattributes` | **runs, via patch-style `git diff`** | stopped by `--no-ext-diff --no-textconv` |
+
+What this confirms and changes:
+- The pointer-file attack is real, not theoretical: a process that can only write inside the worktree can make the bridge's own `git status` run a command of its choosing. Explicit `--git-dir` and `--work-tree` on every bridge git call is therefore a requirement, not a nicety.
+- `git status` did not run the filter driver for a file whose size had changed; `git diff --numstat` did. Which command the summary uses decides which mechanisms are reachable, so the hostile-repository tests must use the exact commands the bridge runs, not only the obvious ones.
+- `--numstat` did not run `textconv`; the patch form did. The bridge never needs the patch form, so it should not run it.
+- The user's global git configuration can define filters too (this machine had git-lfs). The bridge's git environment disables global and system configuration.
+
+**Part B (real Codex)** has not been run yet. Pending: whether the `workspace-write` sandbox can write into the main repository's `.git`, make a commit, run `git status`, reach the network, or read a file outside the working directory, in a linked worktree and in a standalone clone. This decides 6.4 versus 6.5.
+
 ## 13. Implementation slices
 
 Each slice is a separate PR, none enables writing until slice 4, and edit mode stays off unless `RUNNER_DEFAULT_MODE=build_with_approval`.
@@ -225,6 +250,16 @@ Each slice is a separate PR, none enables writing until slice 4, and edit mode s
 3. **Git helper and worktree lifecycle** with the hostile-repository tests. Nothing runs Codex.
 4. **Write runner and summary.** This is the first slice that starts a process with write access, so the #22-style live checklist applies before it merges: a live edit in a throwaway repo, cancel mid-run, kill-and-restart, and a hostile-repository run.
 5. **Sweep, recovery, caps, and configuration validation.**
+
+## 14. Agents (input recorded, not yet designed)
+
+The owner's input: agents are standard agent structures, Markdown files in an agent folder, each defining a goal, skills, and tools. Consequences for this design:
+
+1. **The allowlist is local.** Which agents may be started comes from local configuration. A task names an agent from that list; Slack text never supplies a path or discovers files. An agent file inside the target repository is repository content, which is untrusted.
+2. **`tools` and `skills` in an agent file are requests, not grants.** The bridge grants nothing beyond the sandbox mode and its own configuration. In particular it never honors a request that would enable external MCP tools, network access, or shell access beyond what the sandbox allows. Whether the CLI itself acts on those fields is a separate verification, to be done when the second provider is designed (#7).
+3. **The agent is part of the invocation.** The invocation record and `invocation_sha256` include the agent name and the SHA-256 of the agent file's contents at the time the approval request is created. The runner refuses to start if the file changed after approval, so you approve exactly the instructions that run.
+4. **How an agent reaches Codex is not specified.** `codex exec --help` (0.160.0) lists no agent-file option. The likely mechanism is that the bridge reads the file and places it ahead of the prompt on standard input; that needs its own check, including a size cap and the same escaping rules for what is shown in the approval request.
+5. **Needed from the owner:** the folder location(s), the naming convention, one example file, and whether the same files are meant to be used with both CLIs.
 
 ## Required amendments
 
@@ -238,7 +273,6 @@ These change documents that outrank this one. None is made by this document; eac
 
 ## Open questions
 
-1. **Worktree or clone?** Decided by the spike (6.4 vs 6.5).
-2. **What is an "existing agent"?** The product goal is starting agents that already exist (a QA agent, a project-manager agent). The repository has no such concept yet. It could be a Codex configuration profile, a Claude subagent file, a prompt file, or a role in `AGENTS.md`. How the user names one in Slack, and who defines the allowlist, affects the approval request text and `invocation_sha256`, because the agent becomes part of the invocation. The design is built around a full invocation record so an agent field can be added without redesign.
-3. **Cleanup command:** is a `/discard run-xxxx` command wanted, or is retention plus manual `git worktree remove` enough?
-4. **Dirty checkout:** the current choice is to proceed and state that uncommitted changes are not included. The alternative is to refuse edit tasks when the checkout is dirty.
+1. **Linked worktree or isolated clone?** Decided by Part B of the spike (6.4 versus 6.5).
+2. **Agents (section 14):** location, naming, an example file, and whether both CLIs use the same files.
+3. **macOS Git:** Part A needs to be run on the owner's machine, since the installed Git version may differ from the 2.43.0 used so far.
