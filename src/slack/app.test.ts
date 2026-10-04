@@ -34,6 +34,7 @@ function setup(envOverrides: Record<string, string | undefined> = {}, apiOverrid
   const { log, entries } = capturingLogger();
   const deps: AppDeps = {
     env, log, connect, now: fakeClock(), randomId: fakeIds(), senderIntervalMs: 3_600_000, runnerIntervalMs: 3_600_000, launcher: mock.launcher,
+    checkEnvFile: () => ({ ok: true }),
   };
   return { deps, api, transport, connect, entries, dbPath, repoRoot, mock, handler: () => handler };
 }
@@ -79,6 +80,38 @@ describe("startBridge fails closed", () => {
     const ctx = setup();
     vi.mocked(ctx.transport.start).mockRejectedValueOnce(new Error("wss://CANARY"));
     expect(await startBridge(ctx.deps)).toEqual({ ok: false, failure: { code: "connect" } });
+  });
+});
+
+describe("startBridge env file check", () => {
+  it("refuses before the config is read, the database is opened, or Slack is contacted", async () => {
+    const ctx = setup({ ALLOWED_USER_IDS: "not-valid" });
+    const refusal = { ok: false, code: "env_other_access", path: "/canary/.env" } as const;
+    const check = vi.fn(() => refusal);
+    const result = await startBridge({ ...ctx.deps, checkEnvFile: check });
+    // A config failure would have been reported instead if the config had been loaded first.
+    expect(result).toEqual({ ok: false, failure: { code: "env_file", reason: "env_other_access", path: "/canary/.env" } });
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(existsSync(ctx.dbPath)).toBe(false);
+    expect(ctx.connect).not.toHaveBeenCalled();
+    expect(ctx.transport.start).not.toHaveBeenCalled();
+  });
+
+  it("runs the check before the store is opened and before connecting when it passes", async () => {
+    const ctx = setup();
+    const order: string[] = [];
+    const check = vi.fn(() => {
+      order.push(existsSync(ctx.dbPath) ? "check:db_exists" : "check");
+      return { ok: true } as const;
+    });
+    ctx.connect.mockImplementationOnce(() => {
+      order.push("connect");
+      return { api: ctx.api, transport: ctx.transport };
+    });
+    const result = await startBridge({ ...ctx.deps, checkEnvFile: check });
+    if (!result.ok) throw new Error("expected start");
+    expect(order).toEqual(["check", "connect"]);
+    await result.stop();
   });
 });
 
