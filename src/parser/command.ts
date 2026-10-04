@@ -1,4 +1,4 @@
-import { isModelProfile, type ModelProfile, type Provider } from "../domain/types.js";
+import { isModelProfile, type ModelProfile, type Provider, type RunMode } from "../domain/types.js";
 
 export type Command =
   | {
@@ -6,6 +6,8 @@ export type Command =
       readonly provider: Provider;
       readonly profile: ModelProfile;
       readonly prompt: string;
+      /** `edit` only when the exact `--edit` token followed the profile. Never passed to any CLI. */
+      readonly mode: RunMode;
     }
   | { readonly kind: "status" }
   | { readonly kind: "cancel" }
@@ -36,6 +38,12 @@ const TASK_COMMANDS = {
 /** Upper bound on the prompt, in UTF-16 code units. */
 export const MAX_PROMPT_LENGTH = 4000;
 
+/**
+ * An edit task's approval request shows the whole prompt in one Slack message (3,000 characters),
+ * so the prompt must leave room for the fixed text around it. Shorter than a read-only prompt on purpose.
+ */
+export const MAX_EDIT_PROMPT_LENGTH = 2000;
+
 // Bidirectional override/isolate controls can make logs and echoed text misleading.
 const BIDI_CONTROL = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 
@@ -49,13 +57,15 @@ const fail = (error: ParseErrorCode, message: string): ParseResult => ({ ok: fal
  * not an exact, recognised command yields an error and must not be acted on.
  *
  * Grammar (command must be the first token; matching is case-sensitive):
- *   /codex|/claude|/auto <fast|default|deep> <prompt>
+ *   /codex|/claude|/auto <fast|default|deep> [--edit] <prompt>
  *   /status
  *   /cancel
  *   /approve <run-id>
  *
  * The profile is mandatory and must be an alias; arbitrary provider model IDs,
- * flags, and a missing profile are all rejected. Prompts are opaque text: never
+ * flags, and a missing profile are all rejected. `--edit` is the one exception: the exact,
+ * case-sensitive token immediately after the profile, followed by whitespace and a non-empty
+ * prompt. A prompt that genuinely begins with the word `--edit` must be rephrased. Prompts are opaque text: never
  * tokenised, expanded, or interpreted as shell.
  */
 export function parseCommand(input: string): ParseResult {
@@ -92,7 +102,7 @@ export function parseCommand(input: string): ParseResult {
 }
 
 function parseTask(provider: Provider, name: string, rest: string): ParseResult {
-  const usage = `usage: ${name} <fast|default|deep> <prompt>`;
+  const usage = `usage: ${name} <fast|default|deep> [--edit] <prompt>`;
   if (rest === "") return fail("missing_prompt", usage);
 
   const first = rest.split(/\s+/, 1)[0] ?? "";
@@ -100,10 +110,16 @@ function parseTask(provider: Provider, name: string, rest: string): ParseResult 
     return fail("unknown_profile", "model profile must be one of: fast, default, deep");
   }
 
-  const prompt = rest.slice(first.length).trim();
-  if (prompt === "") return fail("missing_prompt", usage);
-  if (prompt.length > MAX_PROMPT_LENGTH) {
-    return fail("prompt_too_long", `prompt exceeds ${MAX_PROMPT_LENGTH} characters`);
+  let prompt = rest.slice(first.length).trim();
+  let mode: RunMode = "read";
+  if (prompt === "--edit" || /^--edit\s/.test(prompt)) {
+    mode = "edit";
+    prompt = prompt.slice("--edit".length).trim();
   }
-  return { ok: true, command: { kind: "task", provider, profile: first, prompt } };
+  if (prompt === "") return fail("missing_prompt", usage);
+  const max = mode === "edit" ? MAX_EDIT_PROMPT_LENGTH : MAX_PROMPT_LENGTH;
+  if (prompt.length > max) {
+    return fail("prompt_too_long", `prompt exceeds ${max} characters`);
+  }
+  return { ok: true, command: { kind: "task", provider, profile: first, prompt, mode } };
 }

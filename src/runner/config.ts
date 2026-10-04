@@ -2,6 +2,7 @@ import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { ConfigError } from "../slack/config.js";
 import { DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS } from "./limits.js";
+import { CHANNEL_ID_PATTERN } from "../store/validate.js";
 import { canonicalizeRepoRoot, isInside } from "./repo-root.js";
 
 export interface RunnerConfig {
@@ -10,7 +11,23 @@ export interface RunnerConfig {
   /** Absolute path to the Codex executable. Never looked up through PATH. */
   readonly codexBin: string;
   readonly timeoutMs: number;
+  /** Null unless `RUNNER_DEFAULT_MODE=build_with_approval`. Edit tasks are refused everywhere when null. */
+  readonly edit: EditConfig | null;
 }
+
+export interface EditConfig {
+  /** Channels where `--edit` is allowed. Always a subset of the authorized channels. */
+  readonly channelIds: ReadonlySet<string>;
+  /** Canonical, private directory that holds one worktree per edit run. Outside the repository. */
+  readonly worktreeRoot: string;
+  readonly approvalTtlMs: number;
+}
+
+export const DEFAULT_APPROVAL_TTL_MINUTES = 60;
+export const MIN_APPROVAL_TTL_MINUTES = 5;
+export const MAX_APPROVAL_TTL_MINUTES = 1440;
+/** Keeps the approval request, which shows the folder, inside one Slack message. */
+export const MAX_WORKTREE_ROOT_LENGTH = 200;
 
 export type RunnerConfigResult =
   | { readonly ok: true; readonly config: RunnerConfig }
@@ -25,9 +42,13 @@ type Env = Readonly<Record<string, string | undefined>>;
  *
  * Settings that would widen what the runner may do are refused rather than ignored:
  * `CODEX_FLAGS` (extra provider flags could carry a bypass flag), `RUNNER_CONCURRENCY` other than 1,
- * and `RUNNER_DEFAULT_MODE` other than `read_only`.
+ * and `RUNNER_DEFAULT_MODE` other than `read_only` or `build_with_approval`. The latter enables
+ * edit tasks and then requires `EDIT_CHANNEL_IDS` and `WORKTREE_ROOT`.
  */
-export function loadRunnerConfig(env: Env, options: { readonly databasePath: string }): RunnerConfigResult {
+export function loadRunnerConfig(
+  env: Env,
+  options: { readonly databasePath: string; readonly allowedChannelIds?: ReadonlySet<string> },
+): RunnerConfigResult {
   const errors: ConfigError[] = [];
 
   let repoRoot: string | null = null;
@@ -73,8 +94,11 @@ export function loadRunnerConfig(env: Env, options: { readonly databasePath: str
   if (concurrency !== undefined && concurrency.trim() !== "" && concurrency.trim() !== "1") {
     errors.push({ variable: "RUNNER_CONCURRENCY", code: "unsupported" });
   }
-  const mode = env["RUNNER_DEFAULT_MODE"];
-  if (mode !== undefined && mode.trim() !== "" && mode.trim() !== "read_only") errors.push({ variable: "RUNNER_DEFAULT_MODE", code: "unsupported" });
+  const mode = env["RUNNER_DEFAULT_MODE"]?.trim() ?? "";
+  if (mode !== "" && mode !== "read_only" && mode !== "build_with_approval") errors.push({ variable: "RUNNER_DEFAULT_MODE", code: "unsupported" });
+
+  let edit: EditConfig | null = null;
+  if (mode === "build_with_approval") edit = loadEditConfig(env, { repoRoot, databasePath: options.databasePath, allowed: options.allowedChannelIds }, errors);
 
   let timeoutMs = DEFAULT_TIMEOUT_MS;
   const timeoutRaw = env["RUNNER_TIMEOUT_SECONDS"]?.trim();
@@ -88,5 +112,60 @@ export function loadRunnerConfig(env: Env, options: { readonly databasePath: str
   }
 
   if (errors.length > 0 || repoRoot === null || codexBin === null) return { ok: false, errors };
-  return { ok: true, config: { repoRoot, codexBin, timeoutMs } };
+  // An enabled edit mode that failed validation has already added errors above.
+  if (mode === "build_with_approval" && edit === null) return { ok: false, errors };
+  return { ok: true, config: { repoRoot, codexBin, timeoutMs, edit } };
+}
+
+function loadEditConfig(
+  env: Env,
+  context: { readonly repoRoot: string | null; readonly databasePath: string; readonly allowed: ReadonlySet<string> | undefined },
+  errors: ConfigError[],
+): EditConfig | null {
+  const before = errors.length;
+
+  const channelsRaw = env["EDIT_CHANNEL_IDS"]?.trim() ?? "";
+  const channelIds = new Set<string>();
+  if (channelsRaw === "") {
+    errors.push({ variable: "EDIT_CHANNEL_IDS", code: "missing" });
+  } else {
+    const entries = channelsRaw.split(",").map((entry) => entry.trim());
+    if (entries.some((entry) => !CHANNEL_ID_PATTERN.test(entry))) errors.push({ variable: "EDIT_CHANNEL_IDS", code: "malformed" });
+    else if (new Set(entries).size !== entries.length) errors.push({ variable: "EDIT_CHANNEL_IDS", code: "duplicate_entry" });
+    else if (context.allowed === undefined || entries.some((entry) => !context.allowed?.has(entry))) {
+      errors.push({ variable: "EDIT_CHANNEL_IDS", code: "not_in_allowlist" });
+    } else for (const entry of entries) channelIds.add(entry);
+  }
+
+  let worktreeRoot: string | null = null;
+  const rootRaw = env["WORKTREE_ROOT"]?.trim() ?? "";
+  if (rootRaw === "") {
+    errors.push({ variable: "WORKTREE_ROOT", code: "missing" });
+  } else {
+    const result = canonicalizeRepoRoot(rootRaw, { forbidContaining: context.databasePath });
+    if (!result.ok) errors.push({ variable: "WORKTREE_ROOT", code: result.error });
+    else if (result.root.length > MAX_WORKTREE_ROOT_LENGTH) errors.push({ variable: "WORKTREE_ROOT", code: "malformed" });
+    else if (context.repoRoot !== null && (isInside(context.repoRoot, result.root) || isInside(result.root, context.repoRoot))) {
+      errors.push({ variable: "WORKTREE_ROOT", code: "overlaps_repo" });
+    } else {
+      const stat = statSync(result.root);
+      if (typeof process.getuid === "function" && stat.uid !== process.getuid()) errors.push({ variable: "WORKTREE_ROOT", code: "not_owner" });
+      else if ((stat.mode & 0o077) !== 0) errors.push({ variable: "WORKTREE_ROOT", code: "unsafe_permissions" });
+      else worktreeRoot = result.root;
+    }
+  }
+
+  let approvalTtlMs = DEFAULT_APPROVAL_TTL_MINUTES * 60_000;
+  const ttlRaw = env["APPROVAL_TTL_MINUTES"]?.trim() ?? "";
+  if (ttlRaw !== "") {
+    const minutes = /^[0-9]{1,4}$/.test(ttlRaw) ? Number(ttlRaw) : Number.NaN;
+    if (!Number.isInteger(minutes) || minutes < MIN_APPROVAL_TTL_MINUTES || minutes > MAX_APPROVAL_TTL_MINUTES) {
+      errors.push({ variable: "APPROVAL_TTL_MINUTES", code: "malformed" });
+    } else {
+      approvalTtlMs = minutes * 60_000;
+    }
+  }
+
+  if (errors.length > before || worktreeRoot === null) return null;
+  return { channelIds, worktreeRoot, approvalTtlMs };
 }

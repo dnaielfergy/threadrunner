@@ -1,10 +1,10 @@
 import type { ModelProfile } from "../domain/types.js";
 import type { AuthConfig } from "../slack/config.js";
 import type { Logger } from "../slack/log.js";
-import { enqueueMessageParts, getRun, listRunsByState, transitionRun, type Run, type Store } from "../store/index.js";
+import { enqueueMessageParts, expireStaleApprovals, getRun, listRunsByState, transitionRun, type Run, type Store } from "../store/index.js";
 import { buildChildEnv } from "./env.js";
 import { CANCEL_POLL_MS, MAX_OUTPUT_BYTES } from "./limits.js";
-import { completionBody, failureBody, type FailureReason } from "./messages.js";
+import { APPROVAL_EXPIRED_NOTICE, APPROVED_EXPIRED_NOTICE, completionBody, failureBody, type FailureReason } from "./messages.js";
 import type { Launcher, LaunchSpec } from "./process.js";
 import { repoRootStillValid } from "./repo-root.js";
 import { supervise, type Outcome } from "./supervise.js";
@@ -32,6 +32,8 @@ export interface RunnerDeps {
   readonly onEnqueued?: () => void;
   readonly maxOutputBytes?: number;
   readonly pollMs?: number;
+  /** Set when edit mode is enabled: approvals that were never given, or never started, are failed on this schedule. */
+  readonly approvalTtlMs?: number;
 }
 
 export type TickResult = "idle" | "busy" | "stopped" | "ran";
@@ -171,11 +173,27 @@ export function createRunner(deps: RunnerDeps): Runner {
     finish(run, outcome);
   }
 
+  /** Fail approval requests and approved runs whose window has passed. At most 100 per call; runs on every pass. */
+  function sweepApprovals(): void {
+    if (deps.approvalTtlMs === undefined) return;
+    try {
+      const failed = expireStaleApprovals(store, {
+        queuedWriteTtlMs: deps.approvalTtlMs,
+        notices: { awaitingApproval: APPROVAL_EXPIRED_NOTICE, queuedWrite: APPROVED_EXPIRED_NOTICE },
+      });
+      for (const run of failed) note("run_failed:approval_expired", run.id);
+      if (failed.length > 0) deps.onEnqueued?.();
+    } catch {
+      note("approval_sweep_failed", undefined, "error");
+    }
+  }
+
   async function pass(): Promise<TickResult> {
     let ran = false;
     // Each run is attempted at most once per pass, so one that stays queued cannot spin the loop.
     const attempted = new Set<string>();
     try {
+      sweepApprovals();
       for (;;) {
         if (stopped) return ran ? "ran" : "stopped";
         const next = listRunsByState(store, "queued", 100).find((run) => !attempted.has(run.id));
@@ -199,6 +217,7 @@ export function createRunner(deps: RunnerDeps): Runner {
     tick: () => runPass(),
 
     recoverStale: () => {
+      sweepApprovals();
       let recovered = 0;
       for (const run of listRunsByState(store, "running", 100)) {
         if (authorized(run)) say(run, failureBody(run.id, "restarted"));

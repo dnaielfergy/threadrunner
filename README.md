@@ -71,7 +71,7 @@ Usage: `/claude|/codex|/auto <fast|default|deep> <prompt>`. The model profile is
 - **Silence means it did not parse.** Anything that is not exactly a command (a missing profile, a typo, plain chat) is ignored with no reply, by design, so a typo looks the same as an outage. Check the format first, then the bridge's stderr (it logs a `parse:<code>` reason, never your text).
 - **Start every command with `@ThreadRunner`** (`@ThreadRunner /claude default ...`). Use the allowlisted channel; a DM works only if its `D...` ID is also in `ALLOWED_CHANNEL_IDS`, and the mention form in a DM has not been verified. The Slack client blocks a bare leading `/` before the bridge sees it, and there is no workaround, so do not rely on one.
 
-Then reply **in that thread** with `/status` or `/cancel`. `/approve run-<id>` is recognized but does nothing yet.
+Then reply **in that thread** with `/status` or `/cancel`. `/approve run-<id>` only does something for an edit task (below).
 
 `/codex` tasks run read-only against the configured repository and the result is posted in the same thread (see [The Codex runner](#the-codex-runner)).
 
@@ -100,7 +100,11 @@ Add these to `.env` (see `.env.example`). Startup refuses to proceed, naming the
 | `CODEX_BIN` | Absolute path to the Codex CLI (`which codex`). Not looked up through `PATH`. Refused if it is inside the repository, which is untrusted content. |
 | `RUNNER_TIMEOUT_SECONDS` | Optional. Wall-clock limit per run, 10 to 3600. Default 600. |
 | `CODEX_FLAGS` | Must be empty. Extra provider flags are not configurable, so a bypass flag cannot be added here. |
-| `RUNNER_CONCURRENCY`, `RUNNER_DEFAULT_MODE` | If set, only `1` and `read_only` are accepted. |
+| `RUNNER_CONCURRENCY` | If set, only `1` is accepted. |
+| `RUNNER_DEFAULT_MODE` | `read_only` (default) or `build_with_approval`. The second turns on **edit tasks** (below) and then requires `EDIT_CHANNEL_IDS` and `WORKTREE_ROOT`. |
+| `EDIT_CHANNEL_IDS` | Edit mode only. Comma-separated channel IDs where `--edit` is allowed. Each must also be in `ALLOWED_CHANNEL_IDS`. |
+| `WORKTREE_ROOT` | Edit mode only. Absolute path to a directory you own, with no group or other access (`chmod 700`), outside the repository, not containing it or the database, at most 200 characters. |
+| `APPROVAL_TTL_MINUTES` | Edit mode only. How long an approval request stays valid, 5 to 1440. Default 60. |
 
 Codex signs in with your own ChatGPT login (`codex login`), stored under your home directory. No API key is read or passed.
 
@@ -123,7 +127,17 @@ codex exec --sandbox read-only --cd <repo> --ephemeral --ignore-user-config --ig
 
 ### What it cannot do
 
-No edits, commits, pushes, worktrees, approvals (`/approve` stays inert), other repositories, paths from Slack, Claude runs or `/auto` routing (refused with a fixed reason), more than one run at a time, or a different Slack destination than the run's own thread.
+No edits (see below: an approved edit task is queued but nothing runs it yet), commits, pushes, worktrees, other repositories, paths from Slack, Claude runs or `/auto` routing (refused with a fixed reason), more than one run at a time, or a different Slack destination than the run's own thread.
+
+### Edit tasks (approval step only, nothing writes yet)
+
+With `RUNNER_DEFAULT_MODE=build_with_approval`, `/codex default --edit <prompt>` asks for approval instead of running. The `--edit` token must come right after the profile, in exactly that spelling. An edit prompt is limited to 2,000 characters so the whole thing fits in one approval message.
+
+1. The bridge reads the repository's current commit straight from `.git` (it runs no git program) and posts an approval request in the thread: the full prompt, the folder and branch an edit would use, the commit it would start from, what will not happen (no commit, push, pull request, deploy), the expiry, and the exact command to reply with.
+2. Only `/approve run-<id>` from you, in that thread, after the request message was actually delivered, before it expires, approves it. A bare "yes" never does. `/cancel` works at any point, and the approval and a cancel cannot both win.
+3. An approved run moves to `queued_write` and **stops there**. No process is started for it yet, and no worktree is created: that is the next piece of work (docs/design/approvals-and-worktrees.md, slices 3 and 4). Unapproved requests, and approved runs that are never started, are failed with a notice when their window passes.
+
+Edit tasks are refused, with a reason, when edit mode is off, in a channel not listed in `EDIT_CHANNEL_IDS`, with `/claude` or `/auto`, or when the repository has no readable commit (empty, or `.git` is not a plain directory).
 
 ### Limits to know about
 
@@ -257,7 +271,7 @@ npm run check       # both
 
 For the code layout, how tests avoid real providers, running the bridge against a sandbox repository, and startup troubleshooting, see [docs/development.md](./docs/development.md).
 
-Command grammar: `/codex|/claude|/auto <fast|default|deep> <prompt>`, `/status`, `/cancel`, `/approve run-<id>`. Anything else is rejected.
+Command grammar: `/codex|/claude|/auto <fast|default|deep> [--edit] <prompt>`, `/status`, `/cancel`, `/approve run-<id>`. Anything else is rejected.
 
 ## Database
 
@@ -269,6 +283,6 @@ Runs, inbound-event IDs, run events, approvals, and the outbound message queue l
 - **Outbox:** messages are stored, not sent. A sender lists deliverable messages (oldest pending per run), then must call `claimMessage` immediately before posting; it refuses if the run was cancelled in the meantime. Long bodies go through `enqueueMessageParts`. Failures are recorded as fixed reason codes, never free text. Bodies may contain provider output: the sender must escape Slack markup (see the doc comment on `enqueueMessage`).
 - **Journal mode:** WAL, with `foreign_keys = ON`, `busy_timeout = 5000`, and `synchronous = FULL`. Opening fails if WAL cannot be enabled.
 - **Schema versioning:** tracked with `PRAGMA user_version` and forward-only migrations in `src/store/schema.ts`. A database with a newer version than the code supports is refused.
-- **Guarantees enforced in the schema:** unique `(team, event_id)` and `(team, channel, message_ts)` (events rejected for an occupied thread are recorded too, so retries are quiet duplicates); one run per `(team, channel, root thread)`; immutable binding columns; append-only events, approvals, and inbound events; no outbox destination columns. Schema version 2 adds the approval plumbing for edit-mode tasks (`mode`, `edit_requests`, approval hashes, `worktrees`, `requestApproval`, atomic `approveRun`, expiry) with database triggers that refuse any write state without a recorded approval. Nothing uses it yet: edit mode is not reachable from Slack, and no process can write.
+- **Guarantees enforced in the schema:** unique `(team, event_id)` and `(team, channel, message_ts)` (events rejected for an occupied thread are recorded too, so retries are quiet duplicates); one run per `(team, channel, root thread)`; immutable binding columns; append-only events, approvals, and inbound events; no outbox destination columns. Schema version 2 adds the approval plumbing for edit-mode tasks (`mode`, `edit_requests`, approval hashes, `worktrees`, `requestApproval`, atomic `approveRun`, expiry) with database triggers that refuse any write state without a recorded approval. Edit mode is reachable from Slack only when enabled in configuration, and still no process can write.
 
 Run the store tests (they use temporary database files) with `npm test`, or `npx vitest run src/store`.

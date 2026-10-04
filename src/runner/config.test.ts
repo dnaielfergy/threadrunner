@@ -26,7 +26,7 @@ describe("loadRunnerConfig", () => {
   it("accepts exactly one existing root and an absolute executable, canonicalized", () => {
     const { env, repo, bin, databasePath } = setup();
     const result = loadRunnerConfig(env, { databasePath });
-    expect(result).toEqual({ ok: true, config: { repoRoot: repo, codexBin: bin, timeoutMs: 600_000 } });
+    expect(result).toEqual({ ok: true, config: { repoRoot: repo, codexBin: bin, timeoutMs: 600_000, edit: null } });
   });
 
   it("ignores the unused runner settings from .env.example when they hold their only safe value", () => {
@@ -95,7 +95,7 @@ describe("loadRunnerConfig", () => {
 
   it("refuses settings that would widen the runner, and names the variable only", () => {
     const { env, databasePath } = setup();
-    const errors = errorsFor({ ...env, CODEX_FLAGS: "--dangerously-bypass-approvals-and-sandbox", RUNNER_CONCURRENCY: "4", RUNNER_DEFAULT_MODE: "build_with_approval" }, databasePath);
+    const errors = errorsFor({ ...env, CODEX_FLAGS: "--dangerously-bypass-approvals-and-sandbox", RUNNER_CONCURRENCY: "4", RUNNER_DEFAULT_MODE: "yolo" }, databasePath);
     expect(errors).toEqual(
       expect.arrayContaining([
         { variable: "CODEX_FLAGS", code: "unsupported" },
@@ -112,6 +112,78 @@ describe("loadRunnerConfig", () => {
     expect(ok.ok && ok.config.timeoutMs).toBe(120_000);
     for (const bad of ["0", "5", "3601", "-1", "1.5", "ten", "99999999"]) {
       expect(errorsFor({ ...env, RUNNER_TIMEOUT_SECONDS: bad }, databasePath)).toContainEqual({ variable: "RUNNER_TIMEOUT_SECONDS", code: "malformed" });
+    }
+  });
+});
+
+describe("loadRunnerConfig: edit mode", () => {
+  const CHANNELS = new Set(["C0AAAAAAA", "D0AAAAAAA"]);
+  function editSetup() {
+    const s = setup();
+    const worktrees = join(s.base, "worktrees");
+    mkdirSync(worktrees, { mode: 0o700 });
+    chmodSync(worktrees, 0o700);
+    const env = { ...s.env, RUNNER_DEFAULT_MODE: "build_with_approval", EDIT_CHANNEL_IDS: "C0AAAAAAA", WORKTREE_ROOT: worktrees };
+    const load = (e: Record<string, string | undefined>) => loadRunnerConfig(e, { databasePath: s.databasePath, allowedChannelIds: CHANNELS });
+    const errors = (e: Record<string, string | undefined>) => {
+      const r = load(e);
+      if (r.ok) throw new Error("expected failure");
+      return r.errors;
+    };
+    return { ...s, worktrees, env, load, errors };
+  }
+
+  it("is off by default and when the mode is read_only, even if the edit settings are present", () => {
+    const { env, load } = editSetup();
+    expect(load({ ...env, RUNNER_DEFAULT_MODE: undefined })).toMatchObject({ ok: true, config: { edit: null } });
+    expect(load({ ...env, RUNNER_DEFAULT_MODE: "read_only" })).toMatchObject({ ok: true, config: { edit: null } });
+  });
+
+  it("enables edit mode with channels, a private worktree root, and a default 60 minute window", () => {
+    const { env, load, worktrees } = editSetup();
+    const result = load(env);
+    expect(result.ok && result.config.edit).toEqual({ channelIds: new Set(["C0AAAAAAA"]), worktreeRoot: realpathSync(worktrees), approvalTtlMs: 3_600_000 });
+  });
+
+  it("requires the channel list and the worktree root, naming only the variable", () => {
+    const { env, errors } = editSetup();
+    expect(errors({ ...env, EDIT_CHANNEL_IDS: undefined, WORKTREE_ROOT: undefined })).toEqual(
+      expect.arrayContaining([
+        { variable: "EDIT_CHANNEL_IDS", code: "missing" },
+        { variable: "WORKTREE_ROOT", code: "missing" },
+      ]),
+    );
+  });
+
+  it("allows edits only in channels that are already authorized", () => {
+    const { env, errors } = editSetup();
+    expect(errors({ ...env, EDIT_CHANNEL_IDS: "C0ZZZZZZZ" })).toContainEqual({ variable: "EDIT_CHANNEL_IDS", code: "not_in_allowlist" });
+    expect(errors({ ...env, EDIT_CHANNEL_IDS: "C0AAAAAAA,C0AAAAAAA" })).toContainEqual({ variable: "EDIT_CHANNEL_IDS", code: "duplicate_entry" });
+    expect(errors({ ...env, EDIT_CHANNEL_IDS: "general" })).toContainEqual({ variable: "EDIT_CHANNEL_IDS", code: "malformed" });
+  });
+
+  it("refuses a worktree root that overlaps the repository, is open to others, or is missing", () => {
+    const { env, errors, repo, base } = editSetup();
+    expect(errors({ ...env, WORKTREE_ROOT: repo })).toContainEqual({ variable: "WORKTREE_ROOT", code: "overlaps_repo" });
+    const inside = join(repo, "wt");
+    mkdirSync(inside, { mode: 0o700 });
+    expect(errors({ ...env, WORKTREE_ROOT: inside })).toContainEqual({ variable: "WORKTREE_ROOT", code: "overlaps_repo" });
+    // base holds both the repository and the database, so it is refused either way.
+    expect(errors({ ...env, WORKTREE_ROOT: base })).toHaveLength(1);
+    const open = join(base, "open");
+    mkdirSync(open);
+    chmodSync(open, 0o770);
+    expect(errors({ ...env, WORKTREE_ROOT: open })).toContainEqual({ variable: "WORKTREE_ROOT", code: "unsafe_permissions" });
+    expect(errors({ ...env, WORKTREE_ROOT: join(base, "nope") })).toContainEqual({ variable: "WORKTREE_ROOT", code: "not_found" });
+    expect(errors({ ...env, WORKTREE_ROOT: "relative/dir" })).toContainEqual({ variable: "WORKTREE_ROOT", code: "not_absolute" });
+  });
+
+  it("bounds the approval window to 5..1440 minutes", () => {
+    const { env, load, errors } = editSetup();
+    const ok = load({ ...env, APPROVAL_TTL_MINUTES: "5" });
+    expect(ok.ok && ok.config.edit?.approvalTtlMs).toBe(300_000);
+    for (const bad of ["4", "1441", "0", "-5", "1.5", "an hour"]) {
+      expect(errors({ ...env, APPROVAL_TTL_MINUTES: bad })).toContainEqual({ variable: "APPROVAL_TTL_MINUTES", code: "malformed" });
     }
   });
 });

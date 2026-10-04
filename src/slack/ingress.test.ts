@@ -341,18 +341,16 @@ describe("/status, /cancel and /approve", () => {
     expect(codes(ctx.entries).at(-1)).toBe("cancel_no_run");
   });
 
-  it("/approve is parsed but inert: no state change, no approval, no reply, no run event", async () => {
+  it("/approve on a read-only run changes nothing and says why (edit flow: edit-flow.test.ts)", async () => {
     const ctx = setup();
     const { ts, run, binding } = await startRun(ctx);
     const events = listRunEvents(ctx.store, binding).length;
-    const messages = outbox(ctx.store).length;
     const envelope = await ctx.send(reply(`/approve ${run.id}`, ts));
     expect(envelope.acked).toBe(1);
     expect(getRun(ctx.store, binding)?.state).toBe("queued");
     expect(listRunEvents(ctx.store, binding)).toHaveLength(events);
-    expect(outbox(ctx.store)).toHaveLength(messages);
     expect(Number(ctx.store.db.prepare("SELECT count(*) AS n FROM approvals").get()?.["n"])).toBe(0);
-    expect(codes(ctx.entries).at(-1)).toBe("approve_ignored");
+    expect(codes(ctx.entries).at(-1)).toBe("approve_refused:edit_disabled");
   });
 
   it("a bare 'yes' is not a command at all", async () => {

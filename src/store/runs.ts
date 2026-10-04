@@ -279,22 +279,19 @@ const MAX_APPROVAL_TTL_MS = 24 * 60 * 60 * 1000;
  * Move an edit-mode run from `validated` to `awaiting_approval` and queue the approval request
  * message, atomically: either the thread has a request and the run is waiting on it, or neither.
  * `body` is the fixed-template request text built by the caller (it must show what will be approved).
+ * It may be a function of the expiry time, which is only known inside the transaction.
  * Nothing here runs anything or unlocks anything.
  */
 export function requestApproval(
   store: Store,
   binding: Binding,
   runId: string,
-  request: { readonly baseSha: string; readonly body: string; readonly ttlMs: number },
+  request: { readonly baseSha: string; readonly body: string | ((expiresAt: number) => string); readonly ttlMs: number },
 ): RequestApprovalOutcome {
   if (invalidBindingField(binding) || !isRunId(runId) || !isCommitSha(request.baseSha)) return { ok: false, error: "invalid_input" };
   if (!Number.isSafeInteger(request.ttlMs) || request.ttlMs < MIN_APPROVAL_TTL_MS || request.ttlMs > MAX_APPROVAL_TTL_MS) {
     return { ok: false, error: "invalid_input" };
   }
-  if (typeof request.body !== "string" || request.body.length === 0 || request.body.length > MAX_OUTBOX_BODY_LENGTH || request.body.includes("\u0000")) {
-    return { ok: false, error: "invalid_body" };
-  }
-
   return inTransaction(store, (): RequestApprovalOutcome => {
     const run = findByBinding(store, binding);
     if (!run || run.id !== runId) return { ok: false, error: "not_found" };
@@ -302,11 +299,16 @@ export function requestApproval(
     if (run.state !== "validated") return { ok: false, error: "not_validated" };
 
     const now = timestamp(store);
+    const expiresAt = now + request.ttlMs;
+    const body = typeof request.body === "function" ? request.body(expiresAt) : request.body;
+    // Checked before anything is written: returning from the transaction commits what it did.
+    if (typeof body !== "string" || body.length === 0 || body.length > MAX_OUTBOX_BODY_LENGTH || body.includes("\u0000")) {
+      return { ok: false, error: "invalid_body" };
+    }
     const moved = applyTransition(store, run, "awaiting_approval", now);
     if (!moved.ok) return { ok: false, error: moved.error === "stale_state" ? "stale_state" : "not_validated" };
 
-    const messageId = insertMessage(store, run.id, request.body, now);
-    const expiresAt = now + request.ttlMs;
+    const messageId = insertMessage(store, run.id, body, now);
     store.db
       .prepare("INSERT INTO edit_requests (run_id, base_sha, requested_at, expires_at, request_message_id) VALUES (?, ?, ?, ?, ?)")
       .run(run.id, request.baseSha, now, expiresAt, messageId);

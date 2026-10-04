@@ -1,15 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { parseCommand, type ParseErrorCode } from "./command.js";
+import { MAX_EDIT_PROMPT_LENGTH, parseCommand, type ParseErrorCode } from "./command.js";
 
 describe("parseCommand: valid commands", () => {
   const cases: [string, unknown][] = [
-    ["/codex fast fix the failing test", { kind: "task", provider: "codex", profile: "fast", prompt: "fix the failing test" }],
-    ["/claude default summarize the repo", { kind: "task", provider: "claude", profile: "default", prompt: "summarize the repo" }],
-    ["/auto deep review the auth flow", { kind: "task", provider: "auto", profile: "deep", prompt: "review the auth flow" }],
-    ["  /codex fast   padded   prompt  ", { kind: "task", provider: "codex", profile: "fast", prompt: "padded   prompt" }],
-    ["/codex fast line one\nline two", { kind: "task", provider: "codex", profile: "fast", prompt: "line one\nline two" }],
-    ["/codex fast run `rm -rf /` ; echo $(id)", { kind: "task", provider: "codex", profile: "fast", prompt: "run `rm -rf /` ; echo $(id)" }],
-    ["/codex fast " + "x".repeat(4000), { kind: "task", provider: "codex", profile: "fast", prompt: "x".repeat(4000) }],
+    ["/codex fast fix the failing test", { kind: "task", provider: "codex", profile: "fast", prompt: "fix the failing test", mode: "read" }],
+    ["/claude default summarize the repo", { kind: "task", provider: "claude", profile: "default", prompt: "summarize the repo", mode: "read" }],
+    ["/auto deep review the auth flow", { kind: "task", provider: "auto", profile: "deep", prompt: "review the auth flow", mode: "read" }],
+    ["  /codex fast   padded   prompt  ", { kind: "task", provider: "codex", profile: "fast", prompt: "padded   prompt", mode: "read" }],
+    ["/codex fast line one\nline two", { kind: "task", provider: "codex", profile: "fast", prompt: "line one\nline two", mode: "read" }],
+    ["/codex fast run `rm -rf /` ; echo $(id)", { kind: "task", provider: "codex", profile: "fast", prompt: "run `rm -rf /` ; echo $(id)", mode: "read" }],
+    ["/codex fast " + "x".repeat(4000), { kind: "task", provider: "codex", profile: "fast", prompt: "x".repeat(4000), mode: "read" }],
     ["/approve run-abc\n", { kind: "approve", runId: "run-abc" }],
     ["/status", { kind: "status" }],
     ["/cancel", { kind: "cancel" }],
@@ -75,5 +75,54 @@ describe("parseCommand: fails closed", () => {
     const result = parseCommand(input);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.error).toBe(error);
+  });
+});
+
+describe("parseCommand: the --edit token", () => {
+  const task = (text: string) => {
+    const result = parseCommand(text);
+    return result.ok && result.command.kind === "task" ? result.command : null;
+  };
+
+  it("sets edit mode only for the exact token right after the profile", () => {
+    expect(task("/codex default --edit fix the typo")).toEqual({ kind: "task", provider: "codex", profile: "default", prompt: "fix the typo", mode: "edit" });
+    expect(task("/codex default --edit\nfix the typo")?.mode).toBe("edit");
+    expect(task("/codex default   --edit    padded")).toMatchObject({ mode: "edit", prompt: "padded" });
+    expect(task("/codex default fix the typo")?.mode).toBe("read");
+  });
+
+  it.each([
+    ["--EDIT x"],
+    ["--Edit x"],
+    ["-edit x"],
+    ["--editor x"],
+    ["--edit=true x"],
+    ["--edits x"],
+    ["—edit x"],
+  ])("%j is read-only prompt text, not the token", (rest) => {
+    const command = task(`/codex default ${rest}`);
+    expect(command?.mode).toBe("read");
+    expect(command?.prompt).toBe(rest);
+  });
+
+  it("does not look for --edit anywhere but right after the profile", () => {
+    expect(task("/codex default please --edit this")).toMatchObject({ mode: "read", prompt: "please --edit this" });
+    expect(task("/codex --edit default fix")).toBeNull();
+  });
+
+  it("needs a prompt after the token", () => {
+    for (const text of ["/codex default --edit", "/codex default --edit   ", "/codex default --edit\n"]) {
+      const result = parseCommand(text);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.error).toBe("missing_prompt");
+    }
+  });
+
+  it("limits an edit prompt to what fits in one approval request", () => {
+    expect(task(`/codex default --edit ${"x".repeat(MAX_EDIT_PROMPT_LENGTH)}`)?.mode).toBe("edit");
+    const long = parseCommand(`/codex default --edit ${"x".repeat(MAX_EDIT_PROMPT_LENGTH + 1)}`);
+    expect(long.ok).toBe(false);
+    // The read-only limit is unchanged.
+    expect(task(`/codex default ${"x".repeat(MAX_EDIT_PROMPT_LENGTH + 1)}`)?.mode).toBe("read");
   });
 });

@@ -267,4 +267,66 @@ describe("startBridge with the runner", () => {
     expect(ctx.mock.calls).toHaveLength(0);
     await result.stop();
   });
+
+  describe("edit mode (build_with_approval)", () => {
+    const SHA = "0123456789abcdef0123456789abcdef01234567";
+    function editSetup() {
+      const wt = join(realpathSync(tempDir()), "worktrees");
+      mkdirSync(wt, { mode: 0o700 });
+      chmodSync(wt, 0o700);
+      const ctx = setup({ RUNNER_DEFAULT_MODE: "build_with_approval", EDIT_CHANNEL_IDS: DM, WORKTREE_ROOT: wt }, {}, { output: "must not run" });
+      mkdirSync(join(ctx.repoRoot, ".git", "refs", "heads"), { recursive: true });
+      writeFileSync(join(ctx.repoRoot, ".git", "HEAD"), "ref: refs/heads/main\n");
+      writeFileSync(join(ctx.repoRoot, ".git", "refs", "heads", "main"), `${SHA}\n`);
+      return ctx;
+    }
+
+    it("refuses to start when edit mode is on but its settings are missing or wrong", async () => {
+      const ctx = setup({ RUNNER_DEFAULT_MODE: "build_with_approval" });
+      const result = await startBridge(ctx.deps);
+      if (result.ok || result.failure.code !== "config") throw new Error("expected config failure");
+      expect(result.failure.errors).toEqual(
+        expect.arrayContaining([
+          { variable: "EDIT_CHANNEL_IDS", code: "missing" },
+          { variable: "WORKTREE_ROOT", code: "missing" },
+        ]),
+      );
+      expect(ctx.connect).not.toHaveBeenCalled();
+    });
+
+    it("an edit task asks for approval, /approve queues it, and nothing is ever started", async () => {
+      const ctx = editSetup();
+      const { result, handle } = await bridge(ctx);
+      const body = dmMessage("/codex default --edit fix the typo in the README");
+      await handle(fakeEnvelope(body));
+      const ts = String(eventOf(body)["ts"]);
+      const binding = { teamId: TEAM, userId: USER, channelId: DM, rootThreadTs: ts };
+      expect(getRun(result.store, binding)?.state).toBe("awaiting_approval");
+      await vi.waitFor(() => expect(ctx.api.posts.length).toBe(1));
+      const request = String(ctx.api.posts[0]?.text);
+      expect(request).toContain("fix the typo in the README");
+      expect(request).toContain(SHA);
+
+      const run = getRun(result.store, binding);
+      await handle(fakeEnvelope(dmMessage(`/approve ${run?.id}`, { event: { thread_ts: ts } })));
+      expect(getRun(result.store, binding)?.state).toBe("queued_write");
+      await vi.waitFor(() => expect(ctx.api.posts.length).toBe(2));
+      expect(String(ctx.api.posts[1]?.text)).toContain("Approved");
+      expect(ctx.mock.calls).toHaveLength(0);
+      await result.stop();
+    });
+
+    it("without edit mode, an --edit task is refused with a reason", async () => {
+      const ctx = setup();
+      const { result, handle } = await bridge(ctx);
+      const body = dmMessage("/codex default --edit fix it");
+      await handle(fakeEnvelope(body));
+      const ts = String(eventOf(body)["ts"]);
+      expect(getRun(result.store, { teamId: TEAM, userId: USER, channelId: DM, rootThreadTs: ts })?.state).toBe("failed");
+      await vi.waitFor(() => expect(ctx.api.posts.length).toBe(1));
+      expect(String(ctx.api.posts[0]?.text)).toContain("not enabled");
+      expect(ctx.mock.calls).toHaveLength(0);
+      await result.stop();
+    });
+  });
 });

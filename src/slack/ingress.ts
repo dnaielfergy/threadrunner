@@ -5,6 +5,7 @@ import { authorize } from "./authorize.js";
 import { commandText } from "./command-text.js";
 import type { AuthConfig } from "./config.js";
 import { applyCancel, applyStatus } from "./control.js";
+import { applyApprove, startEditRun, type EditIngress } from "./edit-flow.js";
 import { normalizeEventsApiBody } from "./event.js";
 import { safeEventId, type Logger } from "./log.js";
 import type { Envelope } from "./transport.js";
@@ -17,6 +18,8 @@ export interface IngressDeps {
   readonly log: Logger;
   /** Called after something was added to the outbox, so the sender can run promptly. */
   readonly onEnqueued?: () => void;
+  /** Present only when edit mode is enabled. Without it every `--edit` task is refused. */
+  readonly edit?: EditIngress;
 }
 
 export const THREAD_HAS_RUN_REPLY = "This thread already has a run. Start a new top-level message for a new task.";
@@ -41,7 +44,7 @@ export class RecentEvents {
   }
 }
 
-/** Move a run to `queued` through the state machine, one legal step at a time. */
+/** Move a read-only run to `queued` through the state machine, one legal step at a time. */
 function queueRun(store: Store, binding: Binding, from: RunState): boolean {
   let state = from;
   if (state === "received") {
@@ -88,9 +91,15 @@ export function handleEventsApi(deps: IngressDeps, body: unknown, recent: Recent
       provider: command.provider,
       profile: command.profile,
       prompt: command.prompt,
+      mode: command.mode,
     });
     switch (created.status) {
       case "created": {
+        if (created.run.mode === "edit") {
+          const code = startEditRun(store, deps.edit, created.run);
+          deps.onEnqueued?.();
+          return emit(log, code, eventId, created.run.id);
+        }
         if (!queueRun(store, binding, created.run.state)) return emit(log, "run_queue_failed", eventId, created.run.id);
         enqueueMessage(store, created.run.id, queuedReply(created.run));
         deps.onEnqueued?.();
@@ -99,6 +108,11 @@ export function handleEventsApi(deps: IngressDeps, body: unknown, recent: Recent
       case "duplicate": {
         // A crash between create and queue would strand the run in `received`/`validated`: finish it.
         const existing = getRun(store, binding);
+        if (existing?.mode === "edit" && (existing.state === "received" || existing.state === "validated")) {
+          const code = startEditRun(store, deps.edit, existing);
+          deps.onEnqueued?.();
+          return emit(log, code, eventId, existing.id);
+        }
         if (existing && (existing.state === "received" || existing.state === "validated") && queueRun(store, binding, existing.state)) {
           enqueueMessage(store, existing.id, queuedReply(existing));
           deps.onEnqueued?.();
@@ -130,8 +144,8 @@ export function handleEventsApi(deps: IngressDeps, body: unknown, recent: Recent
       code = applyCancel(store, binding);
       break;
     case "approve":
-      // Parsed but inert until the approval work: no state change, no reply.
-      code = "approve_ignored";
+      code = applyApprove(store, deps.edit, binding, command.runId);
+      if (code === "approved" || code.startsWith("approve_refused")) deps.onEnqueued?.();
       break;
   }
   recent.add(keys);

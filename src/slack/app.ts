@@ -1,5 +1,6 @@
 import { buildCodexInvocation } from "../runner/argv.js";
 import { loadRunnerConfig } from "../runner/config.js";
+import { readHeadCommit } from "../runner/head.js";
 import type { Launcher } from "../runner/process.js";
 import { createRunner } from "../runner/runner.js";
 import { openStore, StoreError, type Store } from "../store/index.js";
@@ -49,7 +50,7 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
   const { config } = loaded;
 
   // The runner is configured before anything is opened or connected, and fails closed the same way.
-  const runnerLoaded = loadRunnerConfig(deps.env, { databasePath: config.databasePath });
+  const runnerLoaded = loadRunnerConfig(deps.env, { databasePath: config.databasePath, allowedChannelIds: config.auth.channelIds });
   if (!runnerLoaded.ok) return { ok: false, failure: { code: "config", errors: runnerLoaded.errors } };
   const runnerConfig = runnerLoaded.config;
 
@@ -97,6 +98,7 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
     log: deps.log,
     parentEnv: deps.env,
     onEnqueued: pokeSender,
+    ...(runnerConfig.edit ? { approvalTtlMs: runnerConfig.edit.approvalTtlMs } : {}),
   });
   const pokeRunner = (): void => {
     runner.tick().catch(() => deps.log({ level: "error", code: "runner_tick_failed" }));
@@ -112,6 +114,7 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
       pokeSender();
       pokeRunner();
     },
+    ...(runnerConfig.edit ? { edit: { config: runnerConfig.edit, repoRoot: runnerConfig.repoRoot, readBaseSha: readHeadCommit } } : {}),
   });
 
   try {

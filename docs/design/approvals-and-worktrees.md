@@ -266,7 +266,9 @@ Conclusions:
 Each slice is a separate PR, none enables writing until slice 4, and edit mode stays off unless `RUNNER_DEFAULT_MODE=build_with_approval`.
 
 1. **Schema and store:** migration, triggers, `requestApproval`, atomic `approveRun`, expiry. No behavior change.
-2. **Parser and ingress:** `--edit`, the approval request, and `/approve` gated end to end. A run ends in `queued_write`, which nothing yet consumes.
+2. **Parser and ingress:** `--edit`, the approval request, and `/approve` gated end to end. A run ends in `queued_write`, which nothing yet consumes. *Done.* Two choices made while building it, for the owner to confirm:
+   - The base commit is read from the files in `.git` (`src/runner/head.ts`), not by running git, so this slice needs no git helper. It refuses anything that is not a plain checkout (a linked worktree or submodule, an unborn branch). Slice 3 may replace it with the hardened helper.
+   - An edit prompt is limited to **2,000 characters** (read-only stays 4,000), so the request, which shows the whole prompt, fits in one Slack message and its delivery can be checked as one unit.
 3. **Git helper and worktree lifecycle** with the hostile-repository tests. Nothing runs Codex.
 4. **Write runner and summary.** This is the first slice that starts a process with write access, so the #22-style live checklist applies before it merges: a live edit in a throwaway repo, cancel mid-run, kill-and-restart, and a hostile-repository run.
 5. **Sweep, recovery, caps, and configuration validation.**

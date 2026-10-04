@@ -30,6 +30,10 @@ export type ConfigErrorCode =
   | "not_executable"
   | "inside_repo"
   | "unsafe_root"
+  | "unsafe_permissions"
+  | "not_owner"
+  | "overlaps_repo"
+  | "not_in_allowlist"
   | "unsupported";
 
 /** Names the variable and the problem. Never carries a value, so a bad token cannot leak through an error. */
