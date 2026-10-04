@@ -69,10 +69,13 @@ Initial states:
 
 ```text
 received → validated → queued → running → completed
-                              ├→ awaiting_approval → queued_write → running_write → completed
-                              ├→ cancelled
-                              └→ failed
+               │
+               └→ awaiting_approval → queued_write → running_write → completed
+
+cancelled and failed are reachable from any non-terminal state.
 ```
+
+Only edit-mode tasks take the `validated → awaiting_approval` edge. Read-only tasks go from `validated` to `queued` and cannot reach a write state.
 
 A transition is valid only when it is made by the allowed user, inside the original channel and root thread, and is compatible with the current state. A plain-language acknowledgement such as “yes” is not an approval command.
 
@@ -85,7 +88,7 @@ The implementation must preserve these invariants:
 3. A message cannot affect a run owned by another workspace, user, channel, or root thread.
 4. A provider cannot select an arbitrary command, repository path, credential, or Slack destination.
 5. Write-capable work requires an explicit, unambiguous approval state transition in the originating thread.
-6. Each write-capable run uses a dedicated worktree rooted under a configured repository path.
+6. Each write-capable run uses a dedicated worktree rooted under a configured worktree root.
 7. At most one write-capable run may operate on a repository at a time unless a future design explicitly and safely changes that rule.
 8. A cancellation prevents future work and outbound side effects for that run after cancellation is recorded.
 9. Unknown, malformed, stale, duplicate, or ambiguous inputs fail closed.
