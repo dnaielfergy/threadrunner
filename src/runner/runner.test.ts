@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { applyCancel } from "../slack/control.js";
 import { AUTH, DM, TEAM, USER, capturingLogger } from "../slack/test-fixtures.js";
-import { getRun, listPendingMessages, listRunEvents, transitionRun, type Run, type Store } from "../store/index.js";
+import { getRun, listPendingMessages, listRunEvents, listRunsByState, transitionRun, type Run, type Store } from "../store/index.js";
 import { fakeClock, fakeIds, open, tempDbPath, tempDir } from "../store/test-utils.js";
 import { createRunner, type BuildInvocation } from "./runner.js";
 import { createNodeLauncher } from "./launcher.js";
@@ -245,6 +245,21 @@ describe("one run at a time", () => {
     expect(mock.state.maxActive).toBe(1);
     expect(mock.calls).toHaveLength(3);
     expect([first, second, third].map((r) => getRun(store, r)?.state)).toEqual(["completed", "completed", "completed"]);
+  });
+});
+
+describe("overlapping tick requests", () => {
+  it("every run queued while ticks overlap is processed, with no further poke", async () => {
+    const { store, runner } = setup({ launcher: { output: "ok" } });
+    const results: Promise<string>[] = [];
+    for (let i = 0; i < 40; i++) {
+      queueRun(store);
+      results.push(runner.tick());
+      for (let step = 0; step < i % 7; step++) await Promise.resolve(); // stagger against the microtask boundaries of a pass
+    }
+    await Promise.all(results);
+    expect(listRunsByState(store, "queued")).toEqual([]);
+    expect(listRunsByState(store, "completed", 100).length).toBeGreaterThan(0);
   });
 });
 

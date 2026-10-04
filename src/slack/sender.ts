@@ -170,12 +170,23 @@ export function createSender(deps: SenderDeps): Sender {
     }
     inFlight = (async () => {
       try {
-        let result = await pass();
-        while (rerun && !stopped) {
+        // A pass sends at most the oldest pending message of each run, so a run with several queued
+        // messages (a long result split into parts) needs more passes. Keep going while a pass made
+        // progress, instead of waiting a timer interval per part.
+        let total = await pass();
+        let progressed = total.sent > 0;
+        while ((rerun || progressed) && !stopped) {
           rerun = false;
-          result = await pass();
+          const next = await pass();
+          progressed = next.sent > 0;
+          total = {
+            sent: total.sent + next.sent,
+            failed: total.failed + next.failed,
+            deferred: next.deferred,
+            skipped: next.skipped,
+          };
         }
-        return result;
+        return total;
       } finally {
         inFlight = null;
       }

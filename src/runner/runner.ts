@@ -71,6 +71,8 @@ export function createRunner(deps: RunnerDeps): Runner {
   const pollMs = deps.pollMs ?? CANCEL_POLL_MS;
   const abort = new AbortController();
   let inFlight: Promise<TickResult> | null = null;
+  /** True from the start of a pass until the instant it returns, with nothing awaited in between. */
+  let busy = false;
   let timer: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
 
@@ -173,17 +175,23 @@ export function createRunner(deps: RunnerDeps): Runner {
     let ran = false;
     // Each run is attempted at most once per pass, so one that stays queued cannot spin the loop.
     const attempted = new Set<string>();
-    for (;;) {
-      if (stopped) return ran ? "ran" : "stopped";
-      const next = listRunsByState(store, "queued", 100).find((run) => !attempted.has(run.id));
-      if (!next) return ran ? "ran" : "idle";
-      attempted.add(next.id);
-      try {
-        await execute(next);
-      } catch {
-        note("runner_error", next.id, "error");
+    try {
+      for (;;) {
+        if (stopped) return ran ? "ran" : "stopped";
+        const next = listRunsByState(store, "queued", 100).find((run) => !attempted.has(run.id));
+        if (!next) return ran ? "ran" : "idle";
+        attempted.add(next.id);
+        try {
+          await execute(next);
+        } catch {
+          note("runner_error", next.id, "error");
+        }
+        ran = true;
       }
-      ran = true;
+    } finally {
+      // Runs synchronously with the final "nothing queued" check above, so a tick requested at any
+      // later moment starts a new pass instead of being told "busy" and lost.
+      busy = false;
     }
   }
 
@@ -221,8 +229,9 @@ export function createRunner(deps: RunnerDeps): Runner {
 
   function runPass(): Promise<TickResult> {
     if (stopped) return Promise.resolve("stopped");
-    if (inFlight) return Promise.resolve("busy");
-    inFlight = pass().finally(() => void (inFlight = null));
+    if (busy) return Promise.resolve("busy");
+    busy = true;
+    inFlight = pass();
     return inFlight;
   }
 }
