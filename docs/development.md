@@ -39,7 +39,7 @@ No test starts Codex, opens a network connection, or uses a real Slack token. Te
   - `queueRun()` creates a queued run through the state machine, the way ingress does.
 - **`src/store/test-utils.ts`**: `tempDbPath()` and `open()` give each test a temporary database that is closed and deleted after the test. `fakeClock()` and `fakeIds()` make timestamps and run IDs deterministic.
 - **Source tripwire tests** read the source files and fail if a forbidden pattern appears:
-  - `src/slack/no-execution.test.ts`: no file under `src/slack` may use `child_process`, `worker_threads`, `node:vm`, `node:cluster`, raw network or listener modules (`node:http`, `net`, `tls`, and so on), `eval` or `new Function`, `.listen(`, or filesystem access. A second test drives a full task, status, cancel, approve and send cycle with `child_process` mocked to throw, and checks it was never called.
+  - `src/slack/no-execution.test.ts`: no file under `src/slack` may use `child_process`, `worker_threads`, `node:vm`, `node:cluster`, raw network or listener modules (`node:http`, `net`, `tls`, and so on), `eval` or `new Function`, `.listen(`, or filesystem access. The one exception is `env-check.ts`, which may import only `constants` and `lstatSync` from `node:fs` and makes a single `lstat` of `.env`. A second test drives a full task, status, cancel, approve and send cycle with `child_process` mocked to throw, and checks it was never called.
   - `src/runner/tripwire.test.ts`: `child_process` may appear only in `launcher.ts`. The launcher must use `shell: false` and `detached: true`, must not use `exec`, `execFile`, `spawnSync` or `fork`, and must not pass `process.env` through. No runner file may use `eval`, `.listen(`, network or `vm` modules, import `@slack/`, or read `process.env` (except `env.ts`). No runner file may mention a permission-bypass flag.
 
 If your change trips one of these, change the change, not the test. Loosening a tripwire is a security decision and needs the Security impact section in the PR.
@@ -58,7 +58,7 @@ This needs a real Slack app and a real Codex install, so the Slack and Codex ste
 
    The runner requires a Git repository.
 
-2. Create the Slack app and tokens as described in the README ([Configuring the Slack app](../README.md#configuring-the-slack-app)). Copy `.env.example` to `.env` in the ThreadRunner checkout and fill in the tokens and IDs.
+2. Create the Slack app and tokens as described in the README ([Configuring the Slack app](../README.md#configuring-the-slack-app)). Copy `.env.example` to `.env` in the ThreadRunner checkout and fill in the tokens and IDs. Then run `chmod 600 .env`; startup refuses a `.env` that group or others can access (see the `env_file` codes below).
 
 3. In `.env`, set:
 
@@ -82,11 +82,23 @@ Stop the bridge with Ctrl+C. Deleting the sandbox directory and the database fil
 When configuration or startup is wrong the bridge prints one line to stderr and exits 1:
 
 ```
+startup refused: env_file <code> path=<path> fix: <command>
 startup refused: config <VARIABLE>:<code> ...
 startup refused: <code>
 ```
 
-It never prints values. If you run `npm start 2>> file`, that line goes into the file and you see nothing on screen, so run plain `npm start` first when debugging.
+The `.env` check runs first, before the config is read. It never prints values. If you run `npm start 2>> file`, that line goes into the file and you see nothing on screen, so run plain `npm start` first when debugging.
+
+Codes for `startup refused: env_file`, from `src/slack/env-check.ts`. The check looks only at `./.env` metadata, never its contents, and is skipped if the file does not exist or on Windows:
+
+| Code | Meaning |
+|---|---|
+| `env_other_access` | Any permission bit for others is set. Fix: `chmod 600 .env`. |
+| `env_group_access` | Any permission bit for group is set. Fix: `chmod 600 .env`. |
+| `env_wrong_owner` | The file is not owned by the user running the bridge. |
+| `env_symlink` | `.env` is a symlink. Replace it with a regular file you own. |
+| `env_not_regular` | `.env` is not a regular file (for example a directory). |
+| `env_unreadable` | `lstat` failed for a reason other than the file being absent. |
 
 Codes for `startup refused: config`, from `src/slack/config.ts` and `src/runner/config.ts`:
 
