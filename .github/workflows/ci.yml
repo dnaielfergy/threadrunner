@@ -11,17 +11,43 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         # Oldest supported Node (node:sqlite without a flag) and the latest 22.x.
+        # The oldest entry must equal engines.node in package.json; the
+        # "Check Node matrix" step below fails if they drift.
         node-version: ["22.13.0", "22.x"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - name: Check Node matrix matches engines.node
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const engines = require("./package.json").engines.node;
+            const m = /^>=(\d+\.\d+\.\d+)$/.exec(engines);
+            if (!m) throw new Error("engines.node must look like >=X.Y.Z, got " + engines);
+            const ci = fs.readFileSync(".github/workflows/ci.yml", "utf8");
+            const line = /^\s*node-version:\s*\[(.*)\]\s*$/m.exec(ci);
+            if (!line) throw new Error("node-version matrix not found in ci.yml");
+            const versions = line[1].split(",").map((v) => v.trim().replace(/^"|"$/g, ""));
+            const exact = versions.filter((v) => /^\d+\.\d+\.\d+$/.test(v));
+            const num = (v) => v.split(".").map(Number);
+            const cmp = (a, b) => { const x = num(a), y = num(b); return x[0] - y[0] || x[1] - y[1] || x[2] - y[2]; };
+            const oldest = exact.slice().sort(cmp)[0];
+            if (oldest !== m[1]) {
+              throw new Error("engines.node is " + engines + " but the oldest exact version in the matrix is " + oldest + " ([" + versions.join(", ") + "])");
+            }
+            console.log("matrix [" + versions.join(", ") + "] oldest exact version " + oldest + " matches engines.node");
+          '
       - run: npm ci
       - run: npm run check
-      - run: npm audit
+      # Gate on high and critical only; the weekly audit.yml job reports everything.
+      - run: npm audit --audit-level=high

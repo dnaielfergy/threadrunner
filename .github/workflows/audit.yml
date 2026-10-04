@@ -1,0 +1,31 @@
+# Weekly full-severity npm audit. Known limits, since this job has no write
+# permission and cannot open issues:
+# - GitHub disables scheduled workflows after 60 days without repository
+#   activity. Re-enable from the Actions tab if that happens.
+# - Failure emails go only to the account that last edited the cron line.
+# Enable Dependabot security alerts for the repository as the backstop.
+name: Audit
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.x"
+          cache: npm
+      - run: npm ci
+      # Default level: any known advisory, including low and moderate, fails the run.
+      - run: npm audit
