@@ -4,6 +4,7 @@ import type { Launcher } from "../runner/process.js";
 import { createRunner } from "../runner/runner.js";
 import { openStore, StoreError, type Store } from "../store/index.js";
 import { loadConfig, type ConfigError } from "./config.js";
+import type { EnvCheckResult, EnvFileCode } from "./env-check.js";
 import { createEnvelopeHandler } from "./ingress.js";
 import type { Logger } from "./log.js";
 import { createSender } from "./sender.js";
@@ -20,9 +21,12 @@ export interface AppDeps {
   /** Starts provider processes. Production passes the real launcher; tests pass a fake that starts nothing. */
   readonly launcher: Launcher;
   readonly runnerIntervalMs?: number;
+  /** Checks the `.env` file's permissions. Required so startup order can be tested; production passes `createEnvFileCheck()`. */
+  readonly checkEnvFile: () => EnvCheckResult;
 }
 
 export type StartupFailure =
+  | { readonly code: "env_file"; readonly reason: EnvFileCode; readonly path: string }
   | { readonly code: "config"; readonly errors: readonly ConfigError[] }
   | { readonly code: "store" | "slack_identity" | "workspace_mismatch" | "connect" };
 
@@ -36,6 +40,10 @@ export type StartResult =
  * connection. Nothing is listening for events until every check has passed.
  */
 export async function startBridge(deps: AppDeps): Promise<StartResult> {
+  // First, before the config is acted on: a `.env` other users can read has already exposed the tokens.
+  const envCheck = deps.checkEnvFile();
+  if (!envCheck.ok) return { ok: false, failure: { code: "env_file", reason: envCheck.code, path: envCheck.path } };
+
   const loaded = loadConfig(deps.env);
   if (!loaded.ok) return { ok: false, failure: { code: "config", errors: loaded.errors } };
   const { config } = loaded;

@@ -50,15 +50,29 @@ describe("no provider, subprocess, or listener", () => {
       expect(sources.map(([f]) => f)).toEqual(expect.arrayContaining(["ingress.ts", "sender.ts", "sdk.ts", "authorize.ts"]));
     });
 
+    // The one narrow allowance: the .env permission check does a single lstat and nothing else.
+    const FS_ALLOWED = ["env-check.ts"];
+
     it.each([
       ["child_process / worker / vm / cluster", /child_process|worker_threads|node:vm|node:cluster/],
       ["raw network or listener modules", /node:(http|https|http2|net|tls|dgram)\b/],
       ["dynamic code", /\beval\s*\(|new Function\s*\(/],
       ["a listening server", /\.listen\s*\(/],
-      ["filesystem access", /node:fs|from "fs"/],
     ])("no source file under src/slack uses %s", (_name, pattern) => {
       const offenders = sources.filter(([, text]) => pattern.test(text)).map(([f]) => f);
       expect(offenders).toEqual([]);
+    });
+
+    it("no source file under src/slack uses filesystem access, except the env check", () => {
+      const offenders = sources.filter(([f, text]) => /node:fs|from "fs"/.test(text) && !FS_ALLOWED.includes(f)).map(([f]) => f);
+      expect(offenders).toEqual([]);
+    });
+
+    it("the filesystem allowance covers env-check.ts only, and only for lstat", () => {
+      expect(FS_ALLOWED).toEqual(["env-check.ts"]);
+      const text = sources.find(([f]) => f === "env-check.ts")?.[1] ?? "";
+      const imported = [...text.matchAll(/import\s*\{([^}]*)\}\s*from "node:fs"/g)].flatMap((m) => (m[1] ?? "").split(",").map((s) => s.trim()));
+      expect(imported.sort()).toEqual(["constants", "lstatSync"]);
     });
 
     it("only sdk.ts imports the Slack SDK packages", () => {
