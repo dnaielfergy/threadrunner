@@ -123,7 +123,7 @@ describe("loadRunnerConfig: edit mode", () => {
     const worktrees = join(s.base, "worktrees");
     mkdirSync(worktrees, { mode: 0o700 });
     chmodSync(worktrees, 0o700);
-    const env = { ...s.env, RUNNER_DEFAULT_MODE: "build_with_approval", EDIT_CHANNEL_IDS: "C0AAAAAAA", WORKTREE_ROOT: worktrees };
+    const env = { ...s.env, RUNNER_DEFAULT_MODE: "build_with_approval", EDIT_CHANNEL_IDS: "C0AAAAAAA", WORKTREE_ROOT: worktrees, GIT_BIN: s.bin };
     const load = (e: Record<string, string | undefined>) => loadRunnerConfig(e, { databasePath: s.databasePath, allowedChannelIds: CHANNELS });
     const errors = (e: Record<string, string | undefined>) => {
       const r = load(e);
@@ -142,7 +142,14 @@ describe("loadRunnerConfig: edit mode", () => {
   it("enables edit mode with channels, a private worktree root, and a default 60 minute window", () => {
     const { env, load, worktrees } = editSetup();
     const result = load(env);
-    expect(result.ok && result.config.edit).toEqual({ channelIds: new Set(["C0AAAAAAA"]), worktreeRoot: realpathSync(worktrees), approvalTtlMs: 3_600_000 });
+    expect(result.ok && result.config.edit).toEqual({
+      channelIds: new Set(["C0AAAAAAA"]),
+      worktreeRoot: realpathSync(worktrees),
+      approvalTtlMs: 3_600_000,
+      gitBin: env.GIT_BIN,
+      retentionDays: 7,
+      maxRetained: 20,
+    });
   });
 
   it("requires the channel list and the worktree root, naming only the variable", () => {
@@ -176,6 +183,28 @@ describe("loadRunnerConfig: edit mode", () => {
     expect(errors({ ...env, WORKTREE_ROOT: open })).toContainEqual({ variable: "WORKTREE_ROOT", code: "unsafe_permissions" });
     expect(errors({ ...env, WORKTREE_ROOT: join(base, "nope") })).toContainEqual({ variable: "WORKTREE_ROOT", code: "not_found" });
     expect(errors({ ...env, WORKTREE_ROOT: "relative/dir" })).toContainEqual({ variable: "WORKTREE_ROOT", code: "not_absolute" });
+  });
+
+  it("requires an absolute git executable outside the repository", () => {
+    const { env, errors, repo, base } = editSetup();
+    expect(errors({ ...env, GIT_BIN: undefined })).toContainEqual({ variable: "GIT_BIN", code: "missing" });
+    expect(errors({ ...env, GIT_BIN: "git" })).toContainEqual({ variable: "GIT_BIN", code: "not_absolute" });
+    expect(errors({ ...env, GIT_BIN: join(base, "nope") })).toContainEqual({ variable: "GIT_BIN", code: "not_found" });
+    expect(errors({ ...env, GIT_BIN: base })).toContainEqual({ variable: "GIT_BIN", code: "not_executable" });
+    const inside = writeFakeCli(join(repo, "bin"));
+    expect(errors({ ...env, GIT_BIN: inside })).toContainEqual({ variable: "GIT_BIN", code: "inside_repo" });
+  });
+
+  it("bounds retention (1..365 days) and the retained-worktree cap (1..200)", () => {
+    const { env, load, errors } = editSetup();
+    const ok = load({ ...env, WORKTREE_RETENTION_DAYS: "30", WORKTREE_MAX_RETAINED: "5" });
+    expect(ok.ok && [ok.config.edit?.retentionDays, ok.config.edit?.maxRetained]).toEqual([30, 5]);
+    for (const bad of ["0", "-1", "366", "1.5", "week"]) {
+      expect(errors({ ...env, WORKTREE_RETENTION_DAYS: bad })).toContainEqual({ variable: "WORKTREE_RETENTION_DAYS", code: "malformed" });
+    }
+    for (const bad of ["0", "201", "many"]) {
+      expect(errors({ ...env, WORKTREE_MAX_RETAINED: bad })).toContainEqual({ variable: "WORKTREE_MAX_RETAINED", code: "malformed" });
+    }
   });
 
   it("bounds the approval window to 5..1440 minutes", () => {

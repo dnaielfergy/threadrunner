@@ -51,3 +51,12 @@ export {
   type MessageOutcome,
   type OutboxMessage,
 } from "./outbox.js";
+export {
+  countRetainedWorktrees,
+  getWorktree,
+  listRetainedWorktrees,
+  markWorktreeRemoved,
+  recordWorktree,
+  type RecordWorktreeOutcome,
+  type Worktree,
+} from "./worktrees.js";

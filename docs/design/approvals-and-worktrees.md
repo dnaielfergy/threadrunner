@@ -269,7 +269,11 @@ Each slice is a separate PR, none enables writing until slice 4, and edit mode s
 2. **Parser and ingress:** `--edit`, the approval request, and `/approve` gated end to end. A run ends in `queued_write`, which nothing yet consumes. *Done.* Two choices made while building it, for the owner to confirm:
    - The base commit is read from the files in `.git` (`src/runner/head.ts`), not by running git, so this slice needs no git helper. It refuses anything that is not a plain checkout (a linked worktree or submodule, an unborn branch). Slice 3 may replace it with the hardened helper.
    - An edit prompt is limited to **2,000 characters** (read-only stays 4,000), so the request, which shows the whole prompt, fits in one Slack message and its delivery can be checked as one unit.
-3. **Git helper and worktree lifecycle** with the hostile-repository tests. Nothing runs Codex.
+3. **Git helper and worktree lifecycle** with the hostile-repository tests. Nothing runs Codex. *Done* (`git.ts`, `worktree.ts`, `store/worktrees.ts`; also `GIT_BIN`, `WORKTREE_RETENTION_DAYS`, `WORKTREE_MAX_RETAINED` in configuration). Things this slice found or decided:
+   - `git worktree remove` refuses a worktree whose `.git` file was overwritten, and the agent can overwrite it. After every validation in 6.7 passes, the bridge deletes the validated directory itself (links are unlinked, never followed) and prunes git's registration.
+   - The trusted git directory for a worktree comes from the main repository's own record of it (`.git/worktrees/<run-id>/gitdir`, which the sandbox cannot write), never from the pointer file inside the worktree.
+   - The summary lists new untracked files without line counts (counting would mean reading contents the agent controls). Counts for tracked text files come from `git diff --numstat` against the base commit.
+   - Not in this slice, left for slice 5: the scheduled sweep that applies retention and the run-state conditions in 6.7, startup recovery, and wiring any of this into the runner.
 4. **Write runner and summary.** This is the first slice that starts a process with write access, so the #22-style live checklist applies before it merges: a live edit in a throwaway repo, cancel mid-run, kill-and-restart, and a hostile-repository run.
 5. **Sweep, recovery, caps, and configuration validation.**
 

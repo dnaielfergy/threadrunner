@@ -21,6 +21,12 @@ export interface EditConfig {
   /** Canonical, private directory that holds one worktree per edit run. Outside the repository. */
   readonly worktreeRoot: string;
   readonly approvalTtlMs: number;
+  /** Absolute path to git. Used only by the worktree code, through the launcher. */
+  readonly gitBin: string;
+  /** A finished run's worktree is kept this long for review, then removed. */
+  readonly retentionDays: number;
+  /** Most worktrees kept at once. At the cap, new approvals wait for cleanup. */
+  readonly maxRetained: number;
 }
 
 export const DEFAULT_APPROVAL_TTL_MINUTES = 60;
@@ -28,6 +34,10 @@ export const MIN_APPROVAL_TTL_MINUTES = 5;
 export const MAX_APPROVAL_TTL_MINUTES = 1440;
 /** Keeps the approval request, which shows the folder, inside one Slack message. */
 export const MAX_WORKTREE_ROOT_LENGTH = 200;
+export const DEFAULT_WORKTREE_RETENTION_DAYS = 7;
+export const MAX_WORKTREE_RETENTION_DAYS = 365;
+export const DEFAULT_WORKTREE_MAX_RETAINED = 20;
+export const MAX_WORKTREE_MAX_RETAINED = 200;
 
 export type RunnerConfigResult =
   | { readonly ok: true; readonly config: RunnerConfig }
@@ -166,6 +176,41 @@ function loadEditConfig(
     }
   }
 
-  if (errors.length > before || worktreeRoot === null) return null;
-  return { channelIds, worktreeRoot, approvalTtlMs };
+  let gitBin: string | null = null;
+  const gitRaw = env["GIT_BIN"]?.trim() ?? "";
+  if (gitRaw === "") {
+    errors.push({ variable: "GIT_BIN", code: "missing" });
+  } else if (!isAbsolute(gitRaw) || gitRaw.includes("\u0000")) {
+    errors.push({ variable: "GIT_BIN", code: "not_absolute" });
+  } else {
+    try {
+      const real = realpathSync(gitRaw);
+      if (!statSync(real).isFile()) {
+        errors.push({ variable: "GIT_BIN", code: "not_executable" });
+      } else {
+        accessSync(real, constants.X_OK);
+        // Git inside the repository would be repository content, which is untrusted.
+        if (context.repoRoot !== null && isInside(context.repoRoot, real)) errors.push({ variable: "GIT_BIN", code: "inside_repo" });
+        else gitBin = gitRaw;
+      }
+    } catch {
+      errors.push({ variable: "GIT_BIN", code: "not_found" });
+    }
+  }
+
+  const bounded = (variable: string, fallback: number, max: number): number => {
+    const raw = env[variable]?.trim() ?? "";
+    if (raw === "") return fallback;
+    const value = /^[0-9]{1,4}$/.test(raw) ? Number(raw) : Number.NaN;
+    if (!Number.isInteger(value) || value < 1 || value > max) {
+      errors.push({ variable, code: "malformed" });
+      return fallback;
+    }
+    return value;
+  };
+  const retentionDays = bounded("WORKTREE_RETENTION_DAYS", DEFAULT_WORKTREE_RETENTION_DAYS, MAX_WORKTREE_RETENTION_DAYS);
+  const maxRetained = bounded("WORKTREE_MAX_RETAINED", DEFAULT_WORKTREE_MAX_RETAINED, MAX_WORKTREE_MAX_RETAINED);
+
+  if (errors.length > before || worktreeRoot === null || gitBin === null) return null;
+  return { channelIds, worktreeRoot, approvalTtlMs, gitBin, retentionDays, maxRetained };
 }

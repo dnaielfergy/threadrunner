@@ -104,6 +104,8 @@ Add these to `.env` (see `.env.example`). Startup refuses to proceed, naming the
 | `RUNNER_DEFAULT_MODE` | `read_only` (default) or `build_with_approval`. The second turns on **edit tasks** (below) and then requires `EDIT_CHANNEL_IDS` and `WORKTREE_ROOT`. |
 | `EDIT_CHANNEL_IDS` | Edit mode only. Comma-separated channel IDs where `--edit` is allowed. Each must also be in `ALLOWED_CHANNEL_IDS`. |
 | `WORKTREE_ROOT` | Edit mode only. Absolute path to a directory you own, with no group or other access (`chmod 700`), outside the repository, not containing it or the database, at most 200 characters. |
+| `GIT_BIN` | Edit mode only. Absolute path to git (`which git`). Not looked up through `PATH`; refused inside the repository. |
+| `WORKTREE_RETENTION_DAYS`, `WORKTREE_MAX_RETAINED` | Edit mode only. How long a finished run's worktree is kept (1 to 365, default 7) and the most kept at once (1 to 200, default 20). |
 | `APPROVAL_TTL_MINUTES` | Edit mode only. How long an approval request stays valid, 5 to 1440. Default 60. |
 
 Codex signs in with your own ChatGPT login (`codex login`), stored under your home directory. No API key is read or passed.
@@ -135,9 +137,15 @@ With `RUNNER_DEFAULT_MODE=build_with_approval`, `/codex default --edit <prompt>`
 
 1. The bridge reads the repository's current commit straight from `.git` (it runs no git program) and posts an approval request in the thread: the full prompt, the folder and branch an edit would use, the commit it would start from, what will not happen (no commit, push, pull request, deploy), the expiry, and the exact command to reply with.
 2. Only `/approve run-<id>` from you, in that thread, after the request message was actually delivered, before it expires, approves it. A bare "yes" never does. `/cancel` works at any point, and the approval and a cancel cannot both win.
-3. An approved run moves to `queued_write` and **stops there**. No process is started for it yet, and no worktree is created: that is the next piece of work (docs/design/approvals-and-worktrees.md, slices 3 and 4). Unapproved requests, and approved runs that are never started, are failed with a notice when their window passes.
+3. An approved run moves to `queued_write` and **stops there**. No process is started for it and no worktree is created yet. The worktree code exists and is tested (`src/runner/git.ts`, `worktree.ts`) but nothing calls it until the write runner (docs/design/approvals-and-worktrees.md, slice 4). Unapproved requests, and approved runs that are never started, are failed with a notice when their window passes.
 
 Edit tasks are refused, with a reason, when edit mode is off, in a channel not listed in `EDIT_CHANNEL_IDS`, with `/claude` or `/auto`, or when the repository has no readable commit (empty, or `.git` is not a plain directory).
+
+#### How the bridge uses git (edit mode)
+
+All git the bridge runs goes through one module that uses the same launcher as everything else. Git can run programs named in a repository's configuration, hooks, attributes and filesystem-monitor settings, and an edit run can write inside its worktree, including the `.git` pointer file there. So each call: uses the absolute `GIT_BIN`, a scrubbed environment (no global or system configuration, no prompts), names the git directory explicitly instead of following the worktree's `.git` file, disables hooks and the filesystem monitor, reads attributes from the approved base commit rather than the worktree, and never asks for a patch (no textconv or external diff). The tests plant a canary command in each of these places and show that plain git runs it and the bridge's git does not.
+
+The summary of an edit run lists changed files with added and removed line counts for tracked text files. New untracked files are listed without a line count, because counting would mean reading file contents.
 
 ### Limits to know about
 

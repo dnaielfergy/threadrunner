@@ -1,10 +1,12 @@
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Provider } from "../domain/types.js";
 import { createRunFromEvent, transitionRun, type Run, type Store } from "../store/index.js";
 import { tempDir } from "../store/test-utils.js";
 import { DM, TEAM, USER, nextEventId, nextTs } from "../slack/test-fixtures.js";
+import { createNodeLauncher } from "./launcher.js";
 import type { ExitInfo, Launcher, LaunchSpec } from "./process.js";
+import { supervise } from "./supervise.js";
 
 export const PROMPT_CANARY = "PROMPT-CANARY-5c1e deliver the quarterly summary";
 export const OUTPUT_CANARY = "OUTPUT-CANARY-9d7b the answer is 42";
@@ -123,3 +125,62 @@ export const alive = (pid: number): boolean => {
 };
 
 export const fileExists = existsSync;
+
+// ---- Real git, for the worktree tests. Fixtures run plain, unhardened git on purpose: it is also the control
+// that proves each planted canary really does run when git is not hardened. ----
+
+export const GIT_BIN = "/usr/bin/git";
+export const gitAvailable = existsSync(GIT_BIN);
+
+/** Run git exactly as given (no hardening) and return stdout. Throws on a non-zero exit. */
+export async function plainGit(cwd: string, args: readonly string[], extraEnv: Record<string, string> = {}): Promise<string> {
+  const outcome = await supervise({
+    launcher: createNodeLauncher({ killGraceMs: 200 }),
+    spec: {
+      command: GIT_BIN,
+      args,
+      cwd,
+      env: {
+        PATH: "/usr/bin:/bin",
+        LC_ALL: "C",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_AUTHOR_NAME: "Test",
+        GIT_AUTHOR_EMAIL: "test@example.com",
+        GIT_COMMITTER_NAME: "Test",
+        GIT_COMMITTER_EMAIL: "test@example.com",
+        ...extraEnv,
+      },
+      stdin: "",
+    },
+    timeoutMs: 30_000,
+    maxOutputBytes: 1_000_000,
+    pollMs: 1000,
+    shouldCancel: () => false,
+  });
+  if (outcome.kind !== "exited" || outcome.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${outcome.kind}`);
+  return outcome.output;
+}
+
+/** A repository with one commit (a.txt, b.txt, bin.dat) inside a fresh directory. */
+export async function makeRepo(): Promise<{ base: string; repo: string; gitDir: string; sha: string }> {
+  const base = realpathSync(tempDir());
+  const repo = join(base, "repo");
+  mkdirSync(repo);
+  await plainGit(repo, ["init", "-q", "-b", "main"]);
+  writeFileSync(join(repo, "a.txt"), "one\ntwo\nthree\n");
+  writeFileSync(join(repo, "b.txt"), "bee\n");
+  writeFileSync(join(repo, "bin.dat"), Buffer.from([0, 1, 2, 3, 0, 255]));
+  await plainGit(repo, ["add", "."]);
+  await plainGit(repo, ["commit", "-q", "-m", "initial"]);
+  const sha = (await plainGit(repo, ["rev-parse", "HEAD"])).trim();
+  return { base, repo, gitDir: join(repo, ".git"), sha };
+}
+
+/** An executable shell script that appends a line to `marker` each time git runs it, then behaves like `body`. */
+export function writeCanary(path: string, marker: string, body = "exit 0"): string {
+  writeFileSync(path, `#!/bin/sh\necho ran >> '${marker}'\n${body}\n`);
+  chmodSync(path, 0o755);
+  return path;
+}

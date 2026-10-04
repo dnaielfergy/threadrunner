@@ -274,7 +274,7 @@ describe("startBridge with the runner", () => {
       const wt = join(realpathSync(tempDir()), "worktrees");
       mkdirSync(wt, { mode: 0o700 });
       chmodSync(wt, 0o700);
-      const ctx = setup({ RUNNER_DEFAULT_MODE: "build_with_approval", EDIT_CHANNEL_IDS: DM, WORKTREE_ROOT: wt }, {}, { output: "must not run" });
+      const ctx = setup({ RUNNER_DEFAULT_MODE: "build_with_approval", EDIT_CHANNEL_IDS: DM, WORKTREE_ROOT: wt, GIT_BIN: writeFakeCli(join(tempDir(), "gitbin")) }, {}, { output: "must not run" });
       mkdirSync(join(ctx.repoRoot, ".git", "refs", "heads"), { recursive: true });
       writeFileSync(join(ctx.repoRoot, ".git", "HEAD"), "ref: refs/heads/main\n");
       writeFileSync(join(ctx.repoRoot, ".git", "refs", "heads", "main"), `${SHA}\n`);
