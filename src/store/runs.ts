@@ -90,6 +90,16 @@ export function findRunById(store: Store, runId: string): Run | null {
   return row ? rowToRun(row) : null;
 }
 
+/**
+ * Runs currently in `state`, oldest first (by insertion order), at most `limit` (1 to 100).
+ * Read-only: the runner uses it to find work and must still change state through `transitionRun`.
+ */
+export function listRunsByState(store: Store, state: RunState, limit = 10): Run[] {
+  if (!isRunState(state)) return [];
+  const bounded = Number.isInteger(limit) && limit >= 1 && limit <= 100 ? limit : 10;
+  return store.db.prepare("SELECT * FROM runs WHERE state = ? ORDER BY rowid LIMIT ?").all(state, bounded).map(rowToRun);
+}
+
 /** Look up a run by its full binding. Returns null for malformed input, no match, or any partial match. */
 export function getRun(store: Store, binding: Binding): Run | null {
   if (invalidBindingField(binding)) return null;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { RUN_STATES, type RunState } from "../domain/run-state.js";
 import { RUN_ID_PATTERN } from "../parser/command.js";
-import { createRunFromEvent, getApproval, getRun, listRunEvents, recordApproval, transitionRun, type Binding } from "./index.js";
+import { createRunFromEvent, getApproval, getRun, listRunEvents, listRunsByState, recordApproval, transitionRun, type Binding } from "./index.js";
 import { BINDING, SECRET_PROMPT, fakeClock, fakeIds, newRun, open, tempDbPath } from "./test-utils.js";
 
 const count = (store: ReturnType<typeof open>, table: string): number =>
@@ -487,5 +487,32 @@ describe("prompt handling", () => {
       const rows = JSON.stringify(s.db.prepare(`SELECT * FROM ${String(name)}`).all());
       expect(rows.includes(SECRET_PROMPT), String(name)).toBe(name === "runs");
     }
+  });
+});
+
+describe("listRunsByState", () => {
+  const make = (store: ReturnType<typeof open>, n: number) => {
+    const ts = `1700000${String(n).padStart(3, "0")}.000100`;
+    const created = createRunFromEvent(store, newRun({ eventId: `Ev0LIST${n}`, messageTs: ts, rootThreadTs: ts }));
+    if (created.status !== "created") throw new Error("setup");
+    return created.run;
+  };
+
+  it("returns runs in the given state, oldest first, and only those", () => {
+    const store = open(tempDbPath(), { now: fakeClock(), randomId: fakeIds() });
+    const [a, b, c] = [make(store, 1), make(store, 2), make(store, 3)];
+    if (!a || !b || !c) throw new Error("setup");
+    transitionRun(store, b, "received", "validated");
+    expect(listRunsByState(store, "received").map((r) => r.id)).toEqual([a.id, c.id]);
+    expect(listRunsByState(store, "validated").map((r) => r.id)).toEqual([b.id]);
+    expect(listRunsByState(store, "queued")).toEqual([]);
+  });
+
+  it("bounds the limit and rejects an unknown state", () => {
+    const store = open(tempDbPath(), { now: fakeClock(), randomId: fakeIds() });
+    for (let n = 1; n <= 3; n++) make(store, n);
+    expect(listRunsByState(store, "received", 2)).toHaveLength(2);
+    expect(listRunsByState(store, "received", 0)).toHaveLength(3); // out of range falls back to the default of 10
+    expect(listRunsByState(store, "bogus" as RunState)).toEqual([]);
   });
 });
