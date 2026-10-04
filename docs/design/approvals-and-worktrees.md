@@ -269,15 +269,29 @@ Each slice is a separate PR, none enables writing until slice 4, and edit mode s
 4. **Write runner and summary.** This is the first slice that starts a process with write access, so the #22-style live checklist applies before it merges: a live edit in a throwaway repo, cancel mid-run, kill-and-restart, and a hostile-repository run.
 5. **Sweep, recovery, caps, and configuration validation.**
 
-## 14. Agents (input recorded, not yet designed)
+## 14. Agents (input recorded, mechanism not yet designed)
 
-The owner's input: agents are standard agent structures, Markdown files in an agent folder, each defining a goal, skills, and tools. Consequences for this design:
+The owner's input: agents are standard agent definitions, Markdown files in an agent folder, each defining a goal, skills, and tools. The owner has no agent file yet and asked to follow the existing agent standards. An illustrative example in the Claude Code subagent style (field names written from memory and **not verified against current documentation**; the design below deliberately does not depend on them):
 
-1. **The allowlist is local.** Which agents may be started comes from local configuration. A task names an agent from that list; Slack text never supplies a path or discovers files. An agent file inside the target repository is repository content, which is untrusted.
-2. **`tools` and `skills` in an agent file are requests, not grants.** The bridge grants nothing beyond the sandbox mode and its own configuration. In particular it never honors a request that would enable external MCP tools, network access, or shell access beyond what the sandbox allows. Whether the CLI itself acts on those fields is a separate verification, to be done when the second provider is designed (#7).
-3. **The agent is part of the invocation.** The invocation record and `invocation_sha256` include the agent name and the SHA-256 of the agent file's contents at the time the approval request is created. The runner refuses to start if the file changed after approval, so you approve exactly the instructions that run.
-4. **How an agent reaches Codex is not specified.** `codex exec --help` (0.160.0) lists no agent-file option. The likely mechanism is that the bridge reads the file and places it ahead of the prompt on standard input; that needs its own check, including a size cap and the same escaping rules for what is shown in the approval request.
-5. **Needed from the owner:** the folder location(s), the naming convention, one example file, and whether the same files are meant to be used with both CLIs.
+```markdown
+---
+name: qa-reviewer
+description: Reviews a change for missing tests and risky edge cases.
+tools: Read, Grep, Glob
+---
+You are a QA reviewer. Your goal is to find missing test coverage and risky edge cases in the
+code you are pointed at. Do not modify files. Report findings as a short, prioritized list.
+```
+
+Design rules that hold whatever the exact format turns out to be:
+
+1. **The bridge treats an agent file as opaque text.** It never parses the front matter and never interprets `tools`, `skills`, or `model`. It reads the file, enforces a size cap, hashes it, and passes it along. This keeps the format an implementation detail of the CLI.
+2. **The allowlist is local.** Which agents may be started comes from local configuration (a folder path plus the permitted names). A task names an agent from that list; Slack text never supplies a path and nothing is discovered from Slack. An agent file inside the target repository is repository content, which is untrusted, so the configured folder should be outside the repository or each file must be listed by name.
+3. **`tools` and `skills` are requests, not grants.** The bridge grants nothing beyond the sandbox mode and its own configuration. It never enables external MCP tools, network access, or shell access because an agent file asks for it. Whether a CLI acts on such fields by itself is a separate verification, to be done when the second provider is designed (#7), and the sandbox limits observed in the spike (writes confined, commits blocked, no network) still apply.
+4. **The agent is part of the invocation.** The invocation record and `invocation_sha256` include the agent name and the SHA-256 of the file's contents when the approval request is created. The runner refuses to start if the file changed after approval, so you approve exactly the instructions that run.
+5. **The approval request shows the agent.** Its name, and the first lines of its goal (capped and escaped), appear in the request so the owner sees what is being started, not only their own prompt.
+6. **How an agent reaches Codex is not specified.** `codex exec --help` (0.160.0) lists no agent-file option. The likely mechanism is that the bridge places the file's text ahead of the prompt on standard input, within the same prompt size limit; this needs its own check. For Claude Code a native mechanism may exist; that is for #7.
+7. **Still needed from the owner:** where the agent folder will live, and the allowed names.
 
 ## Required amendments
 
@@ -291,6 +305,6 @@ These change documents that outrank this one. None is made by this document; eac
 
 ## Open questions
 
-1. **Agents (section 14):** folder location, naming, an example file, and whether both CLIs use the same files.
+1. **Agents (section 14):** where the agent folder will live and which names are allowed.
 2. **Read confinement:** is a dedicated OS user for the runner acceptable as the requirement before edit mode is used on a real repository, or should the design also include a best-effort secret redaction pass on replies?
 3. **Read-only runner:** confirm with the quick check that the already-merged read-only mode also reads outside its directory, and decide whether to add a line to the waiver on #22.
