@@ -2,7 +2,7 @@ import { chmodSync, lstatSync, mkdirSync, symlinkSync, writeFileSync } from "nod
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { tempDir } from "../store/test-utils.js";
-import { checkEnvFile, createEnvFileCheck, type EnvStat } from "./env-check.js";
+import { checkEnvFile, createEnvFileCheck, envFileRemedy, type EnvFileCode, type EnvStat } from "./env-check.js";
 
 const CANARY = "xoxb-CANARY-env-check-0123456789";
 const UID = process.getuid?.() ?? 1000;
@@ -86,6 +86,11 @@ describe("checkEnvFile with an injected stat", () => {
     expect(checkEnvFile({ path: "/fake/.env", lstat, uid: UID, platform: "linux" })).toEqual({ ok: false, code: "env_unreadable", path: "/fake/.env" });
   });
 
+  it("fails closed when the uid is unavailable on a POSIX platform", () => {
+    const lstat = () => regular(0o600);
+    expect(checkEnvFile({ path: "/fake/.env", lstat, uid: undefined, platform: "linux" })).toEqual({ ok: false, code: "env_unreadable", path: "/fake/.env" });
+  });
+
   it("skips on Windows without calling lstat", () => {
     const lstat = vi.fn(() => regular(0o666));
     expect(checkEnvFile({ path: "/fake/.env", lstat, uid: undefined, platform: "win32" })).toEqual({ ok: true });
@@ -107,10 +112,34 @@ describe("what the check touches", () => {
     expect(JSON.stringify(check(envFile(0o600)).result)).not.toContain(CANARY);
   });
 
-  it("the production factory checks ./.env relative to the working directory", () => {
-    const result = createEnvFileCheck()();
-    // The repo's own .env may or may not exist; either way the result is well formed and path-only.
-    if (!result.ok) expect(result.path).toMatch(/\.env$/);
-    expect(result).not.toHaveProperty("contents");
+  it("the production factory resolves .env in the given directory and applies the check", () => {
+    const dir = tempDir();
+    const path = join(dir, ".env");
+    expect(createEnvFileCheck(dir)()).toEqual({ ok: true });
+    writeFileSync(path, `SLACK_BOT_TOKEN=${CANARY}\n`);
+    chmodSync(path, 0o600);
+    expect(createEnvFileCheck(dir)()).toEqual({ ok: true });
+    chmodSync(path, 0o644);
+    expect(createEnvFileCheck(dir)()).toEqual({ ok: false, code: "env_other_access", path });
+  });
+});
+
+describe("envFileRemedy", () => {
+  const codes: EnvFileCode[] = ["env_group_access", "env_other_access", "env_wrong_owner", "env_symlink", "env_not_regular", "env_unreadable"];
+
+  it("gives a chmod for the mode refusals and a different instruction for the others", () => {
+    expect(envFileRemedy("env_group_access", "/h/.env")).toBe("chmod 600 '/h/.env'");
+    expect(envFileRemedy("env_other_access", "/h/.env")).toBe("chmod 600 '/h/.env'");
+    for (const code of ["env_symlink", "env_not_regular", "env_wrong_owner", "env_unreadable"] as const) {
+      expect(envFileRemedy(code, "/h/.env")).not.toBe("chmod 600 '/h/.env'");
+    }
+    expect(envFileRemedy("env_symlink", "/h/.env")).toContain("regular file");
+    expect(envFileRemedy("env_wrong_owner", "/h/.env")).toContain("chown");
+  });
+
+  it.each(codes)("shell-quotes a path with a space and a quote for %s", (code) => {
+    const text = envFileRemedy(code, "/my dir/it's/.env");
+    expect(text).toContain(`'/my dir/it'\\''s/.env'`);
+    expect(text).not.toContain(" /my dir/");
   });
 });

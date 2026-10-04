@@ -17,6 +17,17 @@ const { createSender } = await import("./sender.js");
 const { fakeClock, fakeIds, open, tempDbPath } = await import("../store/test-utils.js");
 const fixtures = await import("./test-fixtures.js");
 
+// The only allowed filesystem reference is this single import, and no call that reads or opens a file.
+const ENV_CHECK_IMPORT = 'import { constants, lstatSync } from "node:fs";';
+function envCheckFsViolations(text: string): string[] {
+  const violations: string[] = [];
+  if ((text.match(/node:fs|from "fs"|require\(|import\(/g) ?? []).length !== 1) violations.push("more or fewer than one filesystem reference");
+  if (!text.includes(ENV_CHECK_IMPORT)) violations.push("the fixed import is missing");
+  if (/node:fs\/|import\s+\*\s+as|import\s+(?!type\b)\w+\s*(,|from)/.test(text)) violations.push("namespace, default, or subpath import");
+  if (/readFile|readdir|opendir|openSync|createReadStream|writeFile|\bstatSync\b|\bfstat|\bread\s*\(/.test(text)) violations.push("a read, open, or other stat call");
+  return violations;
+}
+
 describe("no provider, subprocess, or listener", () => {
   it("a full task / status / cancel / approve / send cycle never calls child_process", async () => {
     const store = open(tempDbPath(), { now: fakeClock(), randomId: fakeIds() });
@@ -68,11 +79,31 @@ describe("no provider, subprocess, or listener", () => {
       expect(offenders).toEqual([]);
     });
 
-    it("the filesystem allowance covers env-check.ts only, and only for lstat", () => {
+    it("the filesystem allowance covers env-check.ts only, as one fixed import and no read calls", () => {
       expect(FS_ALLOWED).toEqual(["env-check.ts"]);
       const text = sources.find(([f]) => f === "env-check.ts")?.[1] ?? "";
-      const imported = [...text.matchAll(/import\s*\{([^}]*)\}\s*from "node:fs"/g)].flatMap((m) => (m[1] ?? "").split(",").map((s) => s.trim()));
-      expect(imported.sort()).toEqual(["constants", "lstatSync"]);
+      expect(text).not.toBe("");
+      expect(envCheckFsViolations(text)).toEqual([]);
+    });
+
+    it("the allowance guard rejects every way of reaching more of the filesystem", () => {
+      const ok = 'import { constants, lstatSync } from "node:fs";\nexport const x = 1;\n';
+      expect(envCheckFsViolations(ok)).toEqual([]);
+      for (const bad of [
+        ok + 'import * as fsx from "node:fs";\nexport const leak = (p: string) => fsx.readFileSync(p, "utf8");\n',
+        ok + 'import fs from "node:fs";\n',
+        ok + 'import { readFileSync } from "node:fs";\n',
+        ok + 'import { readFile } from "node:fs/promises";\n',
+        ok + 'const m = await import("node:fs");\n',
+        ok + 'const m = require("fs");\n',
+        ok + 'export const r = (p: string) => readdirSync(p);\n',
+        ok + 'export const s = (p: string) => statSync(p);\n',
+        ok + 'export const o = (p: string) => openSync(p, "r");\n',
+        'import { constants, lstatSync, readFileSync } from "node:fs";\n',
+        'import { lstatSync } from "node:fs";\n',
+      ]) {
+        expect(envCheckFsViolations(bad), bad).not.toEqual([]);
+      }
     });
 
     it("only sdk.ts imports the Slack SDK packages", () => {

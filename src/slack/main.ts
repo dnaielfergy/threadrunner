@@ -1,6 +1,6 @@
 import { createNodeLauncher } from "../runner/launcher.js";
 import { startBridge } from "./app.js";
-import { createEnvFileCheck } from "./env-check.js";
+import { createEnvFileCheck, envFileRemedy } from "./env-check.js";
 import { stderrLogger } from "./log.js";
 import { installCrashHandlers, shutdown } from "./process-guard.js";
 import { createSlackApi, createSocketTransport } from "./sdk.js";
@@ -25,7 +25,7 @@ if (!result.ok) {
   // Only variable names and codes are printed, never values.
   if (result.failure.code === "env_file") {
     const { reason, path } = result.failure;
-    process.stderr.write(`startup refused: env_file ${reason} path=${path} fix: chmod 600 ${path}\n`);
+    process.stderr.write(`startup refused: env_file ${reason} path=${path} fix: ${envFileRemedy(reason, path)}\n`);
     process.exit(1);
   }
   const detail = result.failure.code === "config" ? ` ${result.failure.errors.map((e) => `${e.variable}:${e.code}`).join(" ")}` : "";
