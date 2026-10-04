@@ -1,3 +1,7 @@
+import { buildCodexInvocation } from "../runner/argv.js";
+import { loadRunnerConfig } from "../runner/config.js";
+import type { Launcher } from "../runner/process.js";
+import { createRunner } from "../runner/runner.js";
 import { openStore, StoreError, type Store } from "../store/index.js";
 import { loadConfig, type ConfigError } from "./config.js";
 import { createEnvelopeHandler } from "./ingress.js";
@@ -13,6 +17,9 @@ export interface AppDeps {
   /** Build the Slack connections from validated tokens. Production passes the SDK adapters. */
   readonly connect: (tokens: { botToken: string; appToken: string }) => { api: SlackApi; transport: SocketTransport };
   readonly senderIntervalMs?: number;
+  /** Starts provider processes. Production passes the real launcher; tests pass a fake that starts nothing. */
+  readonly launcher: Launcher;
+  readonly runnerIntervalMs?: number;
 }
 
 export type StartupFailure =
@@ -32,6 +39,11 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
   const loaded = loadConfig(deps.env);
   if (!loaded.ok) return { ok: false, failure: { code: "config", errors: loaded.errors } };
   const { config } = loaded;
+
+  // The runner is configured before anything is opened or connected, and fails closed the same way.
+  const runnerLoaded = loadRunnerConfig(deps.env, { databasePath: config.databasePath });
+  if (!runnerLoaded.ok) return { ok: false, failure: { code: "config", errors: runnerLoaded.errors } };
+  const runnerConfig = runnerLoaded.config;
 
   let store: Store;
   try {
@@ -63,13 +75,34 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
 
   const now = deps.now ?? Date.now;
   const sender = createSender({ store, api, teamId: config.auth.teamId, log: deps.log, now });
+  const pokeSender = (): void => {
+    sender.drain().catch(() => deps.log({ level: "error", code: "drain_failed" }));
+  };
+  const runner = createRunner({
+    store,
+    auth: config.auth,
+    repoRoot: runnerConfig.repoRoot,
+    codexBin: runnerConfig.codexBin,
+    timeoutMs: runnerConfig.timeoutMs,
+    launcher: deps.launcher,
+    buildInvocation: buildCodexInvocation,
+    log: deps.log,
+    parentEnv: deps.env,
+    onEnqueued: pokeSender,
+  });
+  const pokeRunner = (): void => {
+    runner.tick().catch(() => deps.log({ level: "error", code: "runner_tick_failed" }));
+  };
+  // Runs a previous process left in `running` are failed, never re-executed, before anything new can start.
+  runner.recoverStale();
   const handler = createEnvelopeHandler({
     store,
     auth: config.auth,
     botUserId: identity.botUserId,
     log: deps.log,
     onEnqueued: () => {
-      sender.drain().catch(() => deps.log({ level: "error", code: "drain_failed" }));
+      pokeSender();
+      pokeRunner();
     },
   });
 
@@ -79,12 +112,17 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
     return fail({ code: "connect" });
   }
   sender.start(deps.senderIntervalMs ?? 2000);
+  runner.start(deps.runnerIntervalMs ?? 2000);
+  pokeRunner();
 
   return {
     ok: true,
     store,
-    // Order matters: stop new envelopes first, then let the message being posted finish and be
-    // marked sent, and only then close the store. Closing first would lose the `markSent` and re-post it.
+    // Order matters. Stop new envelopes first. Then let the message being posted finish and be
+    // marked sent, and stop sending: a run killed below leaves its failure notice pending in the
+    // outbox, delivered at the next start, so shutdown never posts a second message. Then kill the
+    // running child and record its failure. Only then close the store: closing earlier would lose
+    // the `markSent` and re-post, or lose the failure.
     stop: async () => {
       try {
         await transport.stop();
@@ -92,7 +130,11 @@ export async function startBridge(deps: AppDeps): Promise<StartResult> {
         try {
           await sender.stop();
         } finally {
-          store.close();
+          try {
+            await runner.stop();
+          } finally {
+            store.close();
+          }
         }
       }
     },

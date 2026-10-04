@@ -4,6 +4,7 @@ import {
   MAX_OUTBOX_BODY_LENGTH,
   createRunFromEvent,
   enqueueMessage,
+  enqueueMessageParts,
   getMessageStatus,
   transitionRun,
   type Binding,
@@ -29,6 +30,29 @@ function setup(api = fakeSlackApi(), options: { teamId?: string; textLimit?: num
   };
   return { store, sender, api, entries, clock, makeRun };
 }
+
+describe("a run with several queued messages", () => {
+  it("delivers all parts, in order, in one drain instead of one per timer tick", async () => {
+    const ctx = setup();
+    const run = ctx.makeRun();
+    const body = Array.from({ length: 5 }, (_, i) => `part-${i + 1} ${"x".repeat(MAX_OUTBOX_BODY_LENGTH - 20)}`).join("\n");
+    const queued = enqueueMessageParts(ctx.store, run.id, body);
+    if (!queued.ok) throw new Error("setup");
+    expect(queued.messageIds.length).toBeGreaterThan(1);
+    const result = await ctx.sender.drain();
+    expect(result.sent).toBe(queued.messageIds.length);
+    expect(ctx.api.posts.map((p) => /part-(\d)/.exec(p.text)?.[1])).toEqual(["1", "2", "3", "4", "5"]);
+  });
+
+  it("stops when a pass makes no progress, so a failing message cannot spin the loop", async () => {
+    const ctx = setup(fakeSlackApi({ ok: false, reason: "slack_error" }));
+    const run = ctx.makeRun();
+    enqueueMessage(ctx.store, run.id, "one");
+    enqueueMessage(ctx.store, run.id, "two");
+    await ctx.sender.drain();
+    expect(ctx.api.posts.length).toBeLessThanOrEqual(2);
+  });
+});
 
 describe("posting", () => {
   it("escapes markup and sets every safety flag, exactly", async () => {
@@ -122,12 +146,14 @@ describe("cancellation races", () => {
     cancelB = () => void transitionRun(ctx.store, bBinding, "received", "cancelled");
 
     // B's message was listed, then cancelled while A's post was in flight: the claim refuses it.
-    expect(await ctx.sender.drain()).toEqual({ sent: 1, failed: 0, deferred: 0, skipped: 1 });
-    expect(api.posts.map((p) => p.text)).toEqual(["message for A"]);
-    expect(ctx.entries.map((e) => e.code)).toContain("claim_refused:not_pending");
-    // Only the cancellation acknowledgement, created by the cancel itself, goes out afterwards.
-    await ctx.sender.drain();
+    // Only the cancellation acknowledgement, created by the cancel itself, goes out after A's message
+    // (in the same drain, because the first pass made progress).
+    const result = await ctx.sender.drain();
+    expect(result.sent).toBe(2);
+    expect(result.failed).toBe(0);
     expect(api.posts.map((p) => p.text)).toEqual(["message for A", "Run cancelled."]);
+    expect(ctx.entries.map((e) => e.code)).toContain("claim_refused:not_pending");
+    expect(api.posts.map((p) => p.text)).not.toContain("message for B");
   });
 
   it("a run cancelled before the pass has its pending messages dropped but still gets the cancellation acknowledgement", async () => {

@@ -16,7 +16,21 @@ export interface BridgeConfig {
   readonly appToken: string;
 }
 
-export type ConfigErrorCode = "missing" | "malformed" | "no_users" | "too_many_users" | "duplicate_entry";
+export type ConfigErrorCode =
+  | "missing"
+  | "malformed"
+  | "no_users"
+  | "too_many_users"
+  | "duplicate_entry"
+  // Runner settings (src/runner/config.ts), reported through the same startup path.
+  | "too_many_roots"
+  | "not_absolute"
+  | "not_found"
+  | "not_directory"
+  | "not_executable"
+  | "inside_repo"
+  | "unsafe_root"
+  | "unsupported";
 
 /** Names the variable and the problem. Never carries a value, so a bad token cannot leak through an error. */
 export interface ConfigError {

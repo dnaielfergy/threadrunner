@@ -14,6 +14,7 @@ export {
   getApproval,
   getRun,
   listRunEvents,
+  listRunsByState,
   recordApproval,
   transitionRun,
   type Approval,

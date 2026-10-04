@@ -1,3 +1,4 @@
+import { createNodeLauncher } from "../runner/launcher.js";
 import { startBridge } from "./app.js";
 import { stderrLogger } from "./log.js";
 import { installCrashHandlers, shutdown } from "./process-guard.js";
@@ -11,6 +12,7 @@ installCrashHandlers(process, stderrLogger, (code) => process.exit(code));
 const result = await startBridge({
   env: process.env,
   log: stderrLogger,
+  launcher: createNodeLauncher(),
   connect: ({ botToken, appToken }) => ({
     api: createSlackApi(botToken),
     transport: createSocketTransport(appToken, stderrLogger),

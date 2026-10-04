@@ -47,7 +47,7 @@ Slack Thread Outbox
 
 ## Quick start
 
-> **Status:** early development. The Slack intake (Socket Mode ingress, authorization, run queue, and thread replies) is implemented. **No provider is connected yet**: an accepted task is stored, moved to `queued`, and acknowledged in its thread, and nothing runs it.
+> **Status:** early development. The Slack intake (Socket Mode ingress, authorization, run queue, and thread replies) is implemented, and a **read-only Codex runner** executes `/codex` tasks in one configured repository. `/claude` and `/auto` are not connected yet: those runs are refused with a fixed reason. The runner starts a local process from a Slack message, so do not enable it until the live Slack smoke test (issue #22) is complete.
 
 1. Create a private Slack workspace with only you as a member.
 2. Create the Slack app as described in [Configuring the Slack app](#configuring-the-slack-app).
@@ -73,6 +73,8 @@ Usage: `/claude|/codex|/auto <fast|default|deep> <prompt>`. The model profile is
 
 Then reply **in that thread** with `/status` or `/cancel`. `/approve run-<id>` is recognized but does nothing yet.
 
+`/codex` tasks run read-only against the configured repository and the result is posted in the same thread (see [The Codex runner](#the-codex-runner)).
+
 ### Running it
 
 Run the bridge under a supervisor (launchd, systemd) that restarts it on a non-zero exit. The bridge logs one JSON line per event on stderr, with fixed codes only:
@@ -83,6 +85,52 @@ Run the bridge under a supervisor (launchd, systemd) that restarts it on a non-z
 - `reject:<reason>`, `parse:<code>`: why an incoming event was dropped.
 
 On SIGINT or SIGTERM it stops receiving, finishes the reply being posted, closes the database, and exits (non-zero if that fails, and forced within 20 seconds).
+
+## The Codex runner
+
+A `/codex <fast|default|deep> <prompt>` task is picked up from the queue and run by the Codex CLI on your machine, in **one** repository you configure. It is read-only, bounded, and cancellable.
+
+### Configuration
+
+Add these to `.env` (see `.env.example`). Startup refuses to proceed, naming the variable and never the value, if any of them is wrong.
+
+| Variable | Meaning |
+|---|---|
+| `APPROVED_REPO_ROOTS` | **Exactly one** absolute directory. Resolved with `realpath` at startup. Refused: zero, several, relative or `~` paths, `..` segments, a path that does not exist or is not a directory, the filesystem root, your home directory itself, and any directory that contains the database file. It comes from here only, never from Slack text. |
+| `CODEX_BIN` | Absolute path to the Codex CLI (`which codex`). Not looked up through `PATH`. Refused if it is inside the repository, which is untrusted content. |
+| `RUNNER_TIMEOUT_SECONDS` | Optional. Wall-clock limit per run, 10 to 3600. Default 600. |
+| `CODEX_FLAGS` | Must be empty. Extra provider flags are not configurable, so a bypass flag cannot be added here. |
+| `RUNNER_CONCURRENCY`, `RUNNER_DEFAULT_MODE` | If set, only `1` and `read_only` are accepted. |
+
+Codex signs in with your own ChatGPT login (`codex login`), stored under your home directory. No API key is read or passed.
+
+### What it does
+
+For each queued `/codex` run, one at a time, it runs (verified against `codex exec --help` for codex-cli 0.160.0):
+
+```
+codex exec --sandbox read-only --cd <repo> --ephemeral --ignore-user-config --ignore-rules --color never -
+```
+
+- **Read-only is enforced by Codex's own sandbox** (`--sandbox read-only`), not by the prompt.
+- **The prompt goes on standard input** (the trailing `-`). It is never an argument and never reaches a shell.
+- `--ephemeral` keeps the prompt out of Codex's session files. `--ignore-user-config` stops your `~/.codex/config.toml` (extra tool servers, a looser sandbox) from widening a run. `--ignore-rules` skips execution-policy rule files.
+- The process starts with an **allowlisted environment** (`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TZ`, `TMPDIR`). The Slack tokens, the database path and everything else in the bridge's environment are not inherited.
+- It is stopped after the time limit, or when more than 28,000 bytes of output arrive (it is killed at the first byte over the cap and the partial output is posted with a fixed reason).
+- **`/cancel` terminates the process and everything it started** (the whole process group). After a cancel is recorded, nothing else is posted for that run except the single acknowledgement.
+- The result, or a failure with a **fixed reason**, is posted in the run's own thread through the outbox. Output is untrusted and is escaped by the sender. Standard error is discarded.
+- Logs and run events carry fixed codes and run IDs only: never the prompt, the output, or error text.
+
+### What it cannot do
+
+No edits, commits, pushes, worktrees, approvals (`/approve` stays inert), other repositories, paths from Slack, Claude runs or `/auto` routing (refused with a fixed reason), more than one run at a time, or a different Slack destination than the run's own thread.
+
+### Limits to know about
+
+- **The child runs as your OS user.** ThreadRunner does not restrict what it can *read*; Codex's sandbox decides that. Use a dedicated OS user or a disposable environment if that matters (see SECURITY.md).
+- Repository content is untrusted and can contain prompt injection. The sandbox limits what an injected prompt can *do*, not what it can say in the thread.
+- A run left `running` by a crash or restart is **failed with a fixed reason and never re-executed**. Durable retry and full stale-run recovery are tracked in #8. The failure notice is delivered at the next start.
+- The repository must be a Git repository (the runner does not pass `--skip-git-repo-check`).
 
 ## Roadmap
 
