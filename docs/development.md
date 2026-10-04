@@ -15,7 +15,7 @@ This covers what exists in the repository today: the Slack intake and the read-o
 | `npm run build` | `tsc -p tsconfig.build.json`, output in `dist/` (git-ignored) |
 | `npm start` | `npm run build && node --env-file-if-exists=.env dist/slack/main.js` |
 
-`npm run check` is the gate before every commit. Also run `npm audit`; it must report 0 vulnerabilities.
+`npm run check` is the gate before every commit. Also run `npm audit`; it should report 0 vulnerabilities.
 
 ## Code layout
 
@@ -70,7 +70,7 @@ This needs a real Slack app and a real Codex install, so the Slack and Codex ste
 
    - `APPROVED_REPO_ROOTS` takes exactly one absolute path. No `~`, no relative path, no comma-separated list.
    - `CODEX_BIN` is the output of `which codex`. It is not looked up through `PATH`.
-   - **Do not point `APPROVED_REPO_ROOTS` at the ThreadRunner checkout.** The checkout holds `.env` with your Slack tokens, and a Codex run can read what its sandbox allows inside the repository.
+   - **Do not point `APPROVED_REPO_ROOTS` at the ThreadRunner checkout.** The checkout holds `.env` with your Slack tokens, and a Codex run can read what its sandbox allows inside the repository. This is advice, not a startup check: startup refuses only the filesystem root, your home directory itself, and a directory that contains the database file.
    - **The sandbox must not contain the database file.** Startup refuses a root that contains `DATABASE_PATH`, because a run could read stored prompts. Keep the database in `~/.threadrunner/` or another directory outside any git repository.
 
 4. Run `npm start`. Look for `socket_connected` and `bridge_started` on stderr. Then DM the bot, starting the message with the mention: `@ThreadRunner /codex fast list the files here`.
