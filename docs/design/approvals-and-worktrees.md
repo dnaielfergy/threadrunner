@@ -162,6 +162,8 @@ All validation fails closed at startup, naming the variable and never the value,
 | `WORKTREE_RETENTION_DAYS` | Default 7. |
 | `WORKTREE_MAX_RETAINED` | Default 20. |
 | `RUNNER_EDIT_TIMEOUT_SECONDS` | Default 1800, bounded. |
+| `AGENT_DIRS` | Ordered list of agent folders: repository-relative or absolute (no `~`). Default empty (no agents). See section 14. |
+| `ALLOWED_AGENTS` | Agent names that may be started. Default empty. |
 
 `CODEX_FLAGS` stays refused. There is no setting that adds a provider flag.
 
@@ -190,7 +192,7 @@ All validation fails closed at startup, naming the variable and never the value,
 
 ## 10. Parser
 
-Grammar becomes `/codex|/claude|/auto <fast|default|deep> [--edit] <prompt>`. `--edit` must be the exact, case-sensitive token immediately after the profile, followed by whitespace and a non-empty prompt. It is parsed into `mode: edit` and is never passed to any CLI. A prompt that genuinely begins with the word `--edit` must be rephrased; that is the accepted cost of an unambiguous token. `/approve` is unchanged: the exact `/approve <run-id>`, and a bare "yes" is never approval.
+Grammar becomes `/codex|/claude|/auto <fast|default|deep> [--edit] <prompt>`. `--edit` must be the exact, case-sensitive token immediately after the profile, followed by whitespace and a non-empty prompt. It is parsed into `mode: edit` and is never passed to any CLI. A prompt that genuinely begins with the word `--edit` must be rephrased; that is the accepted cost of an unambiguous token. When agents are added (section 14), an optional `--agent <name>` token may precede `--edit`, in that fixed order; the name must match the agent-name pattern. `/approve` is unchanged: the exact `/approve <run-id>`, and a bare "yes" is never approval.
 
 ## 11. Threat model
 
@@ -208,7 +210,7 @@ Grammar becomes `/codex|/claude|/auto <fast|default|deep> [--edit] <prompt>`. `-
 | T10 | Two writers in one repository | Database partial unique index on `running_write` | Two approved runs: one runs, one waits in `queued_write`; raw SQL for a second `running_write` fails |
 | T11 | Secrets or large content in Slack | Names and counts only; capped lists; no hunks; escaping by the existing sender | Large diff, hostile file names |
 | T12 | Disk exhaustion | Retention and a retained-worktree cap | Cap refusal test |
-| T13 | **Read access outside the working directory (confirmed).** The spike showed the write sandbox let Codex read a file outside its directory. A prompt-injected instruction can make it print that content in its reply, which the bridge posts to Slack. | The bridge cannot restrict reads. Run the bridge under a dedicated OS user that holds no keys or credentials (SECURITY.md already recommends this); no credentials in the child's environment; network appeared disabled in the sandbox (DNS failed), which blocks exfiltration from inside it but not through the reply; consider best-effort secret redaction of replies, which cannot be complete | Spike Part B; a test that replies are bounded and escaped (existing) |
+| T13 | **Read access outside the working directory (confirmed in the spike).** The write sandbox let Codex read a file outside its directory, so injected text could make it print that content in a reply that is posted to Slack. | **Accepted by the owner.** The tool's premise is that only the authenticated owner can use it, and it runs as the owner's own login. Recommended, not required: apply any read restriction the CLI itself offers (limiting it to one folder). Codex 0.160.0 exposes sandbox modes for writes and no read restriction was found in `codex exec --help`, so this is unverified. A dedicated OS user and a best-effort reply scrubber remain optional extra layers. No credentials are placed in the child's environment; network appeared disabled (DNS failed) | Spike Part B (done); replies stay bounded and escaped (existing) |
 
 ## 12. Spike before implementation (needs the owner's machine and real Codex)
 
@@ -286,12 +288,15 @@ code you are pointed at. Do not modify files. Report findings as a short, priori
 Design rules that hold whatever the exact format turns out to be:
 
 1. **The bridge treats an agent file as opaque text.** It never parses the front matter and never interprets `tools`, `skills`, or `model`. It reads the file, enforces a size cap, hashes it, and passes it along. This keeps the format an implementation detail of the CLI.
-2. **The allowlist is local.** Which agents may be started comes from local configuration (a folder path plus the permitted names). A task names an agent from that list; Slack text never supplies a path and nothing is discovered from Slack. An agent file inside the target repository is repository content, which is untrusted, so the configured folder should be outside the repository or each file must be listed by name.
+2. **Where agent files live (owner's input).** In the target repository (for example `.claude/agents/`, `.codex/agents/`, or `agents/`) or in a global folder (for example `~/.claude/agents/`). There is no single standard, so the locations are configuration, not a guess: `AGENT_DIRS`, an ordered list. A repository-relative entry (such as `.claude/agents`) is resolved under the canonical repository root; a global entry must be an absolute path (no `~`, like every other path setting). The first directory containing `<name>.md` wins. Whether Codex itself reads `.codex/agents/` is unverified and this design does not rely on it.
+   - **Names are allowlisted locally.** `ALLOWED_AGENTS` lists the agent names that may be started (default empty: no agents). A name must match `^[a-z0-9][a-z0-9-]{0,63}$`, so it can never contain a path. A task names an agent; Slack text never supplies a path, and nothing is discovered from Slack. A new file appearing in a repository cannot be started until its name is added.
+   - **The file must be safe to read.** A regular file, not a symlink, whose real path is inside the resolved directory, within the size cap. Anything else is refused with a fixed reason.
+   - **Repository content stays untrusted.** An agent file in the target repository can be changed by anyone who can change the repository, so the protection is the name allowlist plus rules 4 and 5 below, not the location.
 3. **`tools` and `skills` are requests, not grants.** The bridge grants nothing beyond the sandbox mode and its own configuration. It never enables external MCP tools, network access, or shell access because an agent file asks for it. Whether a CLI acts on such fields by itself is a separate verification, to be done when the second provider is designed (#7), and the sandbox limits observed in the spike (writes confined, commits blocked, no network) still apply.
 4. **The agent is part of the invocation.** The invocation record and `invocation_sha256` include the agent name and the SHA-256 of the file's contents when the approval request is created. The runner refuses to start if the file changed after approval, so you approve exactly the instructions that run.
-5. **The approval request shows the agent.** Its name, and the first lines of its goal (capped and escaped), appear in the request so the owner sees what is being started, not only their own prompt.
+5. **The approval request shows the agent.** Its name, a short hash, its size, and its first lines (capped and escaped) appear in the request, plus a notice when the content differs from the last time that agent was run, so a changed file is visible at the moment of approval.
 6. **How an agent reaches Codex is not specified.** `codex exec --help` (0.160.0) lists no agent-file option. The likely mechanism is that the bridge places the file's text ahead of the prompt on standard input, within the same prompt size limit; this needs its own check. For Claude Code a native mechanism may exist; that is for #7.
-7. **Still needed from the owner:** where the agent folder will live, and the allowed names.
+7. **Proposed syntax, needs the owner's confirmation:** `/codex default --agent qa-reviewer --edit <prompt>`. `--agent <name>` is an optional token before `--edit`; tokens are in that fixed order. It is parsed into a name only and never passed to a CLI as an argument.
 
 ## Required amendments
 
@@ -305,6 +310,7 @@ These change documents that outrank this one. None is made by this document; eac
 
 ## Open questions
 
-1. **Agents (section 14):** where the agent folder will live and which names are allowed.
-2. **Read confinement:** is a dedicated OS user for the runner acceptable as the requirement before edit mode is used on a real repository, or should the design also include a best-effort secret redaction pass on replies?
-3. **Read-only runner:** confirm with the quick check that the already-merged read-only mode also reads outside its directory, and decide whether to add a line to the waiver on #22.
+1. **Agent folders (section 14):** confirm the proposed `AGENT_DIRS` default and the `--agent` syntax.
+2. **Codex agent locations:** whether Codex reads agent files at all (`.codex/agents/`) is unverified; section 14 does not depend on it.
+
+Resolved by the owner: read confinement is an accepted risk (T13); no `/discard`; proceed on a dirty checkout; linked worktree.
